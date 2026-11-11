@@ -1,0 +1,100 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>hum</title>
+<audio id="suno" preload="auto"></audio>
+<script>
+"use strict";
+// Every message to the engine is one console line: "HUM " + JSON.
+function emit(obj) { console.log("HUM " + JSON.stringify(obj)); }
+
+const audio = document.getElementById("suno");
+let player = null;
+let tokenWaiters = [];
+let lastSunoTick = 0;
+
+function smallestImage(images) {
+  if (!images || !images.length) return "";
+  let best = images[0];
+  for (const im of images) if ((im.width || 999) < (best.width || 999) && (im.width || 0) >= 64) best = im;
+  return best.url || "";
+}
+
+function sunoState() {
+  emit({ t: "sunoState", paused: audio.paused, position: Math.round(audio.currentTime * 1000),
+         duration: isFinite(audio.duration) ? Math.round(audio.duration * 1000) : 0 });
+}
+
+audio.addEventListener("play", sunoState);
+audio.addEventListener("pause", sunoState);
+audio.addEventListener("seeked", sunoState);
+audio.addEventListener("durationchange", sunoState);
+audio.addEventListener("timeupdate", () => {
+  // Position is extrapolated by the panel; a tick every 5s keeps it honest.
+  const now = Date.now();
+  if (now - lastSunoTick > 5000) { lastSunoTick = now; sunoState(); }
+});
+audio.addEventListener("ended", () => emit({ t: "sunoEnded" }));
+audio.addEventListener("error", () => emit({ t: "error", source: "suno", message: "Suno song couldn't load" }));
+
+window.onSpotifyWebPlaybackSDKReady = () => {
+  player = new Spotify.Player({
+    name: "Omarchy",
+    volume: 1.0,
+    getOAuthToken: cb => { tokenWaiters.push(cb); emit({ t: "needToken" }); },
+  });
+  player.addListener("ready", ({ device_id }) => emit({ t: "ready", device: device_id }));
+  player.addListener("not_ready", () => emit({ t: "notReady" }));
+  player.addListener("initialization_error", ({ message }) => emit({ t: "error", source: "spotify", kind: "init", message }));
+  player.addListener("authentication_error", ({ message }) => emit({ t: "error", source: "spotify", kind: "auth", message }));
+  player.addListener("account_error", ({ message }) => emit({ t: "error", source: "spotify", kind: "account", message }));
+  player.addListener("playback_error", ({ message }) => emit({ t: "error", source: "spotify", kind: "playback", message }));
+  player.addListener("player_state_changed", state => {
+    if (!state) { emit({ t: "spState", active: false }); return; }
+    const tr = state.track_window && state.track_window.current_track;
+    emit({
+      t: "spState", active: true, paused: state.paused, position: state.position, duration: state.duration,
+      canPrev: !state.disallows.skipping_prev, canNext: !state.disallows.skipping_next,
+      shuffle: state.shuffle,
+      context: (state.context && state.context.uri) || "",
+      track: tr ? {
+        uri: tr.uri, name: tr.name,
+        artist: (tr.artists || []).map(a => a.name).join(", "),
+        album: tr.album ? tr.album.name : "",
+        image: tr.album ? smallestImage(tr.album.images) : "",
+      } : null,
+    });
+  });
+  player.connect().then(ok => { if (!ok) emit({ t: "error", source: "spotify", kind: "connect", message: "Spotify player didn't connect" }); });
+};
+
+window.hum = {
+  startSpotify() {
+    if (document.getElementById("sdk")) return;
+    const s = document.createElement("script");
+    s.id = "sdk";
+    s.src = "https://sdk.scdn.co/spotify-player.js";
+    s.onerror = () => emit({ t: "error", source: "spotify", kind: "load", message: "Couldn't load Spotify's player (offline?)" });
+    document.head.appendChild(s);
+  },
+  token(t) { const w = tokenWaiters; tokenWaiters = []; for (const cb of w) cb(t); },
+  spToggle() { if (player) player.togglePlay(); },
+  spPause() { if (player) player.pause(); },
+  spResume() { if (player) player.resume(); },
+  spNext() { if (player) player.nextTrack(); },
+  spPrev() { if (player) player.previousTrack(); },
+  spSeek(ms) { if (player) player.seek(ms); },
+  // Chromium's autoplay rules want the element activated once.
+  spActivate() { if (player && player.activateElement) player.activateElement(); },
+
+  sunoPlay(url) {
+    audio.src = url;
+    audio.play().catch(e => emit({ t: "error", source: "suno", message: String(e && e.message || e) }));
+  },
+  sunoToggle() { if (!audio.src) return; audio.paused ? audio.play().catch(() => {}) : audio.pause(); },
+  sunoPause() { audio.pause(); },
+  sunoResume() { if (audio.src) audio.play().catch(() => {}); },
+  sunoSeek(ms) { if (audio.src) audio.currentTime = ms / 1000; },
+  sunoStop() { audio.pause(); audio.removeAttribute("src"); audio.load(); },
+};
+emit({ t: "loaded" });
+</script>

@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "tom.hum",
+  "name": "Hum",
+  "version": "0.1.0",
+  "author": "Tom Finer",
+  "license": "MIT",
+  "description": "Spotify and Suno in one small panel that slides out of the bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Hum",
+    "description": "Play Spotify playlists, search Spotify, and play your Suno library.",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

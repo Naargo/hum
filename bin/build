@@ -1,0 +1,6 @@
+#!/bin/bash
+# Builds build/hum.
+set -e
+cd "$(dirname "$0")/.."
+qmake6 hum.pro >/dev/null
+make -s -j"$(nproc)"
