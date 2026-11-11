@@ -48,6 +48,8 @@ private:
 
   // Spotify
   void spotifyPlaylists(const Done &done);
+  void spotifyRecent(const Done &done);
+  void spotifyAlbum(const QString &id, const Done &done);
   void spotifyTracks(const QString &id, const Done &done);
   void spotifySearch(const QString &q, const Done &done);
   void spotifyPlay(const QJsonObject &args, const Done &done);

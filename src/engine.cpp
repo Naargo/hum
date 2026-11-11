@@ -11,6 +11,7 @@
 #include <QJsonDocument>
 #include <QLocalServer>
 #include <QLocalSocket>
+#include <QSet>
 #include <QStandardPaths>
 #include <QTimer>
 #include <QUrl>
@@ -359,6 +360,7 @@ void Engine::spotifyPlaylists(const Done &done) {
       if (!error.isEmpty() && items.isEmpty()) { done({}, error); return; }
       QJsonArray out;
       out.append(QJsonObject{{"id", "liked"}, {"name", "Liked Songs"}, {"own", true}});
+      out.append(QJsonObject{{"id", "recent"}, {"name", "Recently Played"}, {"own", true}});
       for (const QJsonValue &v : items) {
         QJsonObject p = v.toObject();
         QJsonObject owner = p.value("owner").toObject();
@@ -371,7 +373,23 @@ void Engine::spotifyPlaylists(const Done &done) {
           {"own", own},
         });
       }
-      done(out, QString());
+      // Saved albums go after the playlists, under their own header.
+      collectPages("/me/albums?limit=50", QString(), 300, {}, [=](const QJsonArray &albums, const QString &) mutable {
+        for (const QJsonValue &v : albums) {
+          QJsonObject a = v.toObject().value("album").toObject();
+          if (a.isEmpty()) continue;
+          QStringList artists;
+          for (const QJsonValue &ar : a.value("artists").toArray()) artists << ar.toObject().value("name").toString();
+          out.append(QJsonObject{
+            {"id", "album:" + a.value("id").toString()}, {"uri", a.value("uri").toString()},
+            {"name", util::clip(a.value("name").toString(), 120)},
+            {"owner", util::clip(artists.join(", "), 80)},
+            {"image", smallestImage(a.value("images").toArray())},
+            {"own", false}, {"section", "Albums"},
+          });
+        }
+        done(out, QString());
+      });
     });
   };
   if (!m_meId.isEmpty()) { list(); return; }
@@ -382,7 +400,62 @@ void Engine::spotifyPlaylists(const Done &done) {
   });
 }
 
+void Engine::spotifyRecent(const Done &done) {
+  m_spotify->api("GET", "/me/player/recently-played?limit=50", {}, [=](const QJsonDocument &doc, const QString &error) {
+    if (!error.isEmpty()) {
+      if (error.contains("403") || error.contains("orbidden") || error.contains("scope")) {
+        done({}, "Reconnect Spotify to see what you played recently");
+        return;
+      }
+      done({}, error);
+      return;
+    }
+    // Newest first; a song played twice shows once, at its latest play.
+    QJsonArray tracks;
+    QSet<QString> seen;
+    for (const QJsonValue &v : doc.object().value("items").toArray()) {
+      QJsonObject t = v.toObject().value("track").toObject();
+      QString uri = t.value("uri").toString();
+      if (t.isEmpty() || t.value("is_local").toBool() || seen.contains(uri)) continue;
+      seen.insert(uri);
+      tracks.append(mapTrack(t));
+    }
+    done(QJsonObject{{"tracks", tracks}, {"restricted", false}}, QString());
+  });
+}
+
+void Engine::spotifyAlbum(const QString &id, const Done &done) {
+  m_spotify->api("GET", "/albums/" + id, {}, [=](const QJsonDocument &doc, const QString &error) {
+    if (!error.isEmpty()) { done({}, error); return; }
+    QJsonObject album = doc.object();
+    // An album's tracks don't carry the album, so lend them its cover.
+    QJsonObject cover{{"images", album.value("images")}};
+    QJsonObject page = album.value("tracks").toObject();
+    auto finish = [=](const QJsonArray &items) {
+      QJsonArray tracks;
+      for (const QJsonValue &v : items) {
+        QJsonObject t = v.toObject();
+        if (t.isEmpty() || t.value("is_local").toBool()) continue;
+        t["album"] = cover;
+        tracks.append(mapTrack(t));
+      }
+      done(QJsonObject{{"tracks", tracks}, {"restricted", false}}, QString());
+    };
+    QString next = page.value("next").toString();
+    if (next.isEmpty()) { finish(page.value("items").toArray()); return; }
+    collectPages(next, QString(), 500, page.value("items").toArray(),
+                 [=](const QJsonArray &items, const QString &) { finish(items); });
+  });
+}
+
 void Engine::spotifyTracks(const QString &id, const Done &done) {
+  if (id == "recent") { spotifyRecent(done); return; }
+  if (id.startsWith("album:")) {
+    QString albumId = id.mid(6);
+    if (!QRegularExpression("^[A-Za-z0-9]{1,64}$").match(albumId).hasMatch()) { done({}, "Bad album id"); return; }
+    spotifyAlbum(albumId, done);
+    return;
+  }
   bool liked = id == "liked";
   if (!liked && !QRegularExpression("^[A-Za-z0-9]{1,64}$").match(id).hasMatch()) { done({}, "Bad playlist id"); return; }
   QString url = liked ? "/me/tracks?limit=50" : "/playlists/" + id + "/items?limit=100";
