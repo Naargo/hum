@@ -51,6 +51,8 @@ Panel {
   property var suLists: []
   property var suOpen: null
   property var suTracks: []
+  property var recentTracks: []
+  property bool recentNeedsReconnect: false
   property bool loading: false
   property string message: ""
   property int cursor: 0
@@ -58,6 +60,7 @@ Panel {
 
   readonly property bool spotifyReadyToBrowse: !!(spotify && spotify.loggedIn)
   readonly property bool sunoReadyToBrowse: !!(suno && suno.loggedIn)
+  readonly property bool spotifyLoggingIn: !!(spotify && spotify.loggingIn)
 
   // Rows of the list area, as plain objects. "kind" decides how one looks
   // and what Enter does with it.
@@ -100,6 +103,16 @@ Panel {
       }
       return out
     }
+    if (tab === "recent") {
+      if (!spotify.configured) return out
+      if (!spotify.loggedIn || recentNeedsReconnect) {
+        out.push({ kind: "action", id: "spotify.login", label: spotify.loggingIn ? "Waiting for your browser… (click to open it again)" : (recentNeedsReconnect ? "Reconnect Spotify to see what you played recently" : "Connect Spotify"), glyph: gMusic })
+        return out
+      }
+      for (var r = 0; r < recentTracks.length; r++) out.push({ kind: "track", source: "recent", index: r, item: recentTracks[r] })
+      if (!recentTracks.length && !loading) out.push({ kind: "note", label: "Nothing played yet" })
+      return out
+    }
     if (!suno.loggedIn) {
       out.push({ kind: "action", id: "suno.login", label: suno.loggingIn ? "Finish signing in, in the Suno window" : "Sign in to Suno", glyph: gMusic })
       return out
@@ -131,6 +144,16 @@ Panel {
     if (tab === "spotify" && spotifyReadyToBrowse && !spLists.length) {
       loading = true
       svc.call("spotify.playlists", {}, function(r) { loading = false; if (r.ok) spLists = r.data; else report(r) })
+    }
+    // Recent reloads every time, so it's always current.
+    if (tab === "recent" && spotifyReadyToBrowse) {
+      loading = true
+      svc.call("spotify.tracks", { id: "recent" }, function(r) {
+        loading = false
+        if (r.ok) { recentTracks = r.data.tracks; recentNeedsReconnect = false; return }
+        if ((r.error || "").indexOf("Reconnect") === 0) recentNeedsReconnect = true
+        else report(r)
+      })
     }
     if (tab === "suno" && sunoReadyToBrowse && !suLists.length) {
       loading = true
@@ -169,7 +192,7 @@ Panel {
   function back() {
     if (tab === "spotify" && query !== "") { searchField.text = ""; return }
     if (tab === "spotify") spOpen = null
-    else suOpen = null
+    else if (tab === "suno") suOpen = null
     cursor = 0
     list.positionViewAtBeginning()
   }
@@ -178,12 +201,14 @@ Panel {
     message = ""
     if (row.source === "suno") {
       svc.call("suno.play", { list: suOpen.id, index: row.index }, report)
+    } else if (row.source === "recent") {
+      svc.call("spotify.play", { uris: recentTracks.map(function(t) { return t.uri }), index: row.index }, report)
     } else if (row.source === "search") {
       svc.call("spotify.play", { uris: spResults.tracks.map(function(t) { return t.uri }), index: row.index }, report)
     } else if (spOpen && spOpen.uri) {
       svc.call("spotify.play", { context: spOpen.uri, uri: row.item.uri }, report)
     } else {
-      // Liked Songs and Recently Played have no Spotify context to play from.
+      // Liked Songs has no Spotify context to play from.
       svc.call("spotify.play", { uris: spTracks.map(function(t) { return t.uri }), index: row.index }, report)
     }
   }
@@ -239,7 +264,10 @@ Panel {
   }
 
   // Sign-in finishing (or the engine coming up) makes the lists loadable.
-  onSpotifyReadyToBrowseChanged: if (spotifyReadyToBrowse) loadLists(); else { spLists = []; spOpen = null }
+  onSpotifyReadyToBrowseChanged: if (spotifyReadyToBrowse) { recentNeedsReconnect = false; loadLists() } else { spLists = []; spOpen = null; recentTracks = [] }
+  // Reconnecting while already signed in doesn't flip spotifyReadyToBrowse,
+  // so refresh Recent when the browser round trip ends.
+  onSpotifyLoggingInChanged: if (!spotifyLoggingIn && tab === "recent") { recentNeedsReconnect = false; loadLists() }
   onSunoReadyToBrowseChanged: if (sunoReadyToBrowse) loadLists(); else { suLists = []; suOpen = null }
   onOpenedChanged: if (opened) {
     svc.ensure()
@@ -337,7 +365,7 @@ Panel {
       }
       onActivateRequested: if (root.cursorActive) root.activateRow(root.rows[root.cursor])
       onCloseRequested: root.close()
-      onTabRequested: function(direction) { root.setTab(root.tab === "spotify" ? "suno" : "spotify") }
+      onTabRequested: function(direction) { root.setTab(root.tab === "spotify" ? "suno" : root.tab === "suno" ? "recent" : "spotify") }
       onTextKey: function(t) {
         if (t === " ") root.transport("toggle")
         else if (t === "n") root.transport("next")
@@ -345,6 +373,7 @@ Panel {
         else if (t === "/" && root.tab === "spotify" && root.spotifyReadyToBrowse) searchField.forceActiveFocus()
         else if (t === "1") root.setTab("spotify")
         else if (t === "2") root.setTab("suno")
+        else if (t === "3") root.setTab("recent")
       }
 
       // ---- header: the two sources ----
@@ -354,7 +383,7 @@ Panel {
         anchors.left: parent.left
         spacing: Style.space(4)
         Repeater {
-          model: [{ id: "spotify", label: "Spotify" }, { id: "suno", label: "Suno" }]
+          model: [{ id: "spotify", label: "Spotify" }, { id: "suno", label: "Suno" }, { id: "recent", label: "Recent" }]
           Item {
             required property var modelData
             width: tabLabel.implicitWidth + Style.space(20)
@@ -480,7 +509,7 @@ Panel {
         }
 
         Text {
-          readonly property string sourceError: root.tab === "spotify" ? (root.spotify ? root.spotify.error : "") : (root.suno ? root.suno.error : "")
+          readonly property string sourceError: root.tab !== "suno" ? (root.spotify ? root.spotify.error : "") : (root.suno ? root.suno.error : "")
           visible: text !== ""
           width: parent.width
           wrapMode: Text.Wrap

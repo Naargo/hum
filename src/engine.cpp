@@ -360,7 +360,6 @@ void Engine::spotifyPlaylists(const Done &done) {
       if (!error.isEmpty() && items.isEmpty()) { done({}, error); return; }
       QJsonArray out;
       out.append(QJsonObject{{"id", "liked"}, {"name", "Liked Songs"}, {"own", true}});
-      out.append(QJsonObject{{"id", "recent"}, {"name", "Recently Played"}, {"own", true}});
       for (const QJsonValue &v : items) {
         QJsonObject p = v.toObject();
         QJsonObject owner = p.value("owner").toObject();

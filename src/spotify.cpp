@@ -13,10 +13,18 @@
 #include <QTimer>
 #include <QUrlQuery>
 
+// Every scope Hum could ever want, asked for once. Spotify can't add a scope
+// to an existing sign-in, so a feature that needed a new one would force
+// everyone to reconnect after updating. Asking for all of them up front means
+// new features (liking songs, following artists, editing playlists, top
+// tracks...) just work.
 static const char *scopes =
-  "streaming user-read-email user-read-private user-read-playback-state "
-  "user-modify-playback-state playlist-read-private playlist-read-collaborative "
-  "user-library-read user-read-recently-played";
+  "streaming app-remote-control user-read-email user-read-private "
+  "user-read-playback-state user-modify-playback-state user-read-currently-playing "
+  "user-read-playback-position user-read-recently-played user-top-read "
+  "playlist-read-private playlist-read-collaborative playlist-modify-private "
+  "playlist-modify-public user-library-read user-library-modify "
+  "user-follow-read user-follow-modify ugc-image-upload";
 
 static QString redirectUri() {
   return QString("http://127.0.0.1:%1/callback").arg(Spotify::callbackPort);
