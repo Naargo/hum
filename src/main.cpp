@@ -18,12 +18,21 @@ static void setChromiumFlags() {
     "--disable-background-networking",
     "--js-flags=--max-old-space-size=96",
   };
-  // Spotify's audio is Widevine-protected. Brave keeps a copy of Google's
-  // Widevine module; Qt WebEngine can use it when told where it is.
-  QDirIterator it(QDir::homePath() + "/.config/BraveSoftware/Brave-Browser/WidevineCdm",
-                  {"libwidevinecdm.so"}, QDir::Files, QDirIterator::Subdirectories);
+  // Spotify's audio is Widevine-protected. Brave, Chrome and Chromium each
+  // keep a copy of Google's Widevine module; Qt WebEngine can use it when
+  // told where it is. The first browser with a copy wins, newest version.
+  const QStringList dirs = {
+    "/.config/BraveSoftware/Brave-Browser/WidevineCdm",
+    "/.config/google-chrome/WidevineCdm",
+    "/.config/chromium/WidevineCdm",
+  };
   QString newest;
-  while (it.hasNext()) { QString p = it.next(); if (p > newest) newest = p; }
+  for (const QString &dir : dirs) {
+    QDirIterator it(QDir::homePath() + dir, {"libwidevinecdm.so"}, QDir::Files,
+                    QDirIterator::Subdirectories);
+    while (it.hasNext()) { QString p = it.next(); if (p > newest) newest = p; }
+    if (!newest.isEmpty()) break;
+  }
   if (!newest.isEmpty()) flags << "--widevine-path=" + newest;
   qputenv("QTWEBENGINE_CHROMIUM_FLAGS", flags.join(' ').toUtf8());
 }
