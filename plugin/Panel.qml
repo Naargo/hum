@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import Quickshell
+import Quickshell.Io
 import Quickshell.Widgets
 import qs.Commons
 import qs.Commons as Commons
@@ -73,21 +74,34 @@ Panel {
   property int cursor: 0
   property bool cursorActive: false
 
-  readonly property bool spotifyReadyToBrowse: !!(spotify && spotify.loggedIn)
-  readonly property bool sunoReadyToBrowse: !!(suno && suno.loggedIn)
+  // Before the engine is up, the cache's memory of the last sign-in stands
+  // in, so the lists can show while it starts. Suno only confirms its
+  // session after a moment, so a remembered Suno sign-in holds until a
+  // fetch or a sign-out says otherwise.
+  readonly property bool spotifyReadyToBrowse: st ? !!(spotify && spotify.loggedIn) : rememberedSpotify
+  readonly property bool sunoReadyToBrowse: st ? (!!(suno && suno.loggedIn) || sunoTrusted) : rememberedSuno
+  readonly property bool spotifyLoggedInNow: !!(st && st.spotify && st.spotify.loggedIn)
+  readonly property bool sunoLoggedInNow: !!(st && st.suno && st.suno.loggedIn)
+  property bool sunoTrusted: false
+  property bool rememberedSpotify: false
+  property bool rememberedSuno: false
   readonly property bool spotifyLoggingIn: !!(spotify && spotify.loggingIn)
 
   // Rows of the list area, as plain objects. "kind" decides how one looks
   // and what Enter does with it.
   readonly property var rows: {
     var out = []
-    if (!st || !st.spotify || !st.suno) return out
+    if (st && (!st.spotify || !st.suno)) return out
     // Read straight from st: the spotify/suno shorthands can lag a beat
-    // behind it while a new state lands.
-    var spotify = st.spotify, suno = st.suno
+    // behind it while a new state lands. Without st the engine is still
+    // starting, and the cached lists show.
+    var spotify = st ? st.spotify : null, suno = st ? st.suno : null
+    var spIn = spotify ? spotify.loggedIn : rememberedSpotify
+    var suIn = suno ? (suno.loggedIn || sunoTrusted) : rememberedSuno
     if (tab === "spotify") {
-      if (!spotify.configured) return out
-      if (!spotify.loggedIn) {
+      if (spotify && !spotify.configured) return out
+      if (!spIn) {
+        if (!spotify) return out
         out.push({ kind: "action", id: "spotify.login", label: spotify.loggingIn ? "Waiting for your browser… (click to open it again)" : "Connect Spotify", glyph: gMusic })
         return out
       }
@@ -129,7 +143,8 @@ Panel {
       }
       return out
     }
-    if (!suno.loggedIn) {
+    if (!suIn) {
+      if (!suno) return out
       out.push({ kind: "action", id: "suno.importBrave", label: "Use my Suno sign-in from Brave", glyph: gMusic })
       out.push({ kind: "action", id: "suno.login", label: suno.loggingIn ? "Finish signing in, in the Suno window" : "Sign in to Suno here", glyph: gMusic })
       return out
@@ -179,37 +194,138 @@ Panel {
     if (reply && !reply.ok) message = reply.error || "Something went wrong"
   }
 
-  function loadLists() {
-    if (tab === "spotify" && spotifyReadyToBrowse && !spLists.length) {
-      loading = true
-      svc.call("spotify.playlists", {}, function(r) { loading = false; if (r.ok) spLists = r.data; else report(r) })
+  // ---- the cache: lists as they were last seen ----------------------------
+  // The engine quits when the music stops, so opening the panel often means
+  // waiting for it to start and fetch everything again. The panel keeps the
+  // last lists it saw in a file and shows them at once, then fetches fresh
+  // ones. Usually nothing changed and the swap is invisible. When something
+  // did, the scroll stays where it was and only the new rows fade in.
+
+  property var cache: ({})
+  property var fetched: ({})   // keys fetched since the panel opened
+  property var newKeys: ({})   // rows that just arrived, to fade in
+
+  FileView {
+    id: cacheFile
+    path: (Quickshell.env("XDG_CACHE_HOME") || (Quickshell.env("HOME") + "/.cache")) + "/hum-panel.json"
+    blockLoading: true
+    printErrors: false
+  }
+  Timer { id: cacheSave; interval: 1000; onTriggered: cacheFile.setText(JSON.stringify(root.cache)) }
+  Timer { id: newKeysClear; interval: 800; onTriggered: root.newKeys = ({}) }
+
+  Component.onCompleted: {
+    try { cache = JSON.parse(cacheFile.text() || "{}") || {} } catch (e) { cache = {} }
+    rememberedSpotify = !!cache["login:spotify"]
+    rememberedSuno = !!cache["login:suno"]
+    sunoTrusted = rememberedSuno
+  }
+
+  function remember(key, value) {
+    if (JSON.stringify(cache[key]) === JSON.stringify(value)) return
+    var next = Object.assign({}, cache)
+    next[key] = value
+    cache = next
+    cacheSave.restart()
+    if (key === "login:spotify") rememberedSpotify = !!value
+    if (key === "login:suno") rememberedSuno = !!value
+  }
+
+  function forget(prefix) {
+    var next = {}
+    for (var k in cache) if (k.indexOf(prefix) !== 0) next[k] = cache[k]
+    cache = next
+    cacheSave.restart()
+  }
+
+  function rowKey(item) { return item ? String(item.uri || item.id || "") : "" }
+  function itemsOf(v) { return !v ? [] : Array.isArray(v) ? v : (v.tracks || []) }
+
+  // Put fresh data in place of what's showing.
+  function swapIn(shown, fresh, write) {
+    if (JSON.stringify(shown) === JSON.stringify(fresh)) return
+    var before = itemsOf(shown), had = {}, arrived = {}
+    for (var i = 0; i < before.length; i++) had[rowKey(before[i])] = true
+    if (before.length) {
+      var after = itemsOf(fresh)
+      for (var j = 0; j < after.length; j++) {
+        var k = rowKey(after[j])
+        if (k && !had[k]) arrived[k] = true
+      }
     }
-    // Liked and My songs load once; Recent reloads every time, so it's current.
+    newKeys = arrived
+    newKeysClear.restart()
+    var y = list.contentY
+    write(fresh)
+    list.forceLayout()
+    list.contentY = Math.max(0, Math.min(y, list.contentHeight - list.height))
+  }
+
+  // Show what the cache holds for key right away, then fetch it fresh once
+  // per opening of the panel. read() is what's showing (null if the view
+  // moved on), write() shows a value, pick() turns a reply into one.
+  function fetchFresh(key, cmd, args, pick, read, write, onError) {
+    var shown = read()
+    if (shown !== null && !itemsOf(shown).length && cache[key]) { write(cache[key]); shown = cache[key] }
+    // Asking the engine starts it, and the shell merely loading mustn't.
+    // The panel opening fetches whatever this skipped.
+    if (fetched[key] || (!svc.up && !opened)) return
+    fetched[key] = true
+    var waiting = !itemsOf(shown).length
+    if (waiting) loading = true
+    svc.call(cmd, args, function(r) {
+      if (waiting) loading = false
+      if (!r.ok) {
+        fetched[key] = false
+        if (onError) onError(r); else report(r)
+        return
+      }
+      var value = pick(r.data)
+      remember(key, value)
+      var now = read()
+      if (now !== null) swapIn(now, value, write)
+    })
+  }
+
+  function sunoFetchFailed(r) {
+    var e = r.error || ""
+    if (e.indexOf("isn't connected") >= 0 || e.indexOf("not signed in") >= 0) {
+      sunoTrusted = false
+      remember("login:suno", false)
+    }
+    report(r)
+  }
+
+  function asIs(d) { return d }
+  function tracksOf(d) { return d.tracks }
+
+  function loadLists() {
+    if (tab === "spotify" && spotifyReadyToBrowse)
+      fetchFresh("spotify:lists", "spotify.playlists", {}, asIs,
+                 function() { return spLists }, function(v) { spLists = v })
+    // Liked and My songs refresh once per opening; Recent every time it's
+    // shown, so it's current.
     var ready = tab === "suno" ? sunoReadyToBrowse : spotifyReadyToBrowse
     var key = tab + ":" + sub
-    if (ready && (sub === "liked" || sub === "mine") && !subTracks[key]) {
-      loading = true
-      svc.call(tab === "suno" ? "suno.tracks" : "spotify.tracks", { id: sub }, function(r) {
-        loading = false
-        if (!r.ok) { report(r); return }
-        var next = Object.assign({}, subTracks)
-        next[key] = r.data.tracks
-        subTracks = next
-      })
+    if (ready && (sub === "liked" || sub === "mine")) {
+      fetchFresh(key, tab === "suno" ? "suno.tracks" : "spotify.tracks", { id: sub }, tracksOf,
+                 function() { return subTracks[key] || [] },
+                 function(v) { var next = Object.assign({}, subTracks); next[key] = v; subTracks = next },
+                 tab === "suno" ? sunoFetchFailed : null)
     }
     if (tab === "spotify" && spSub === "recent" && spotifyReadyToBrowse) {
-      loading = true
-      svc.call("spotify.tracks", { id: "recent" }, function(r) {
-        loading = false
-        if (r.ok) { recentTracks = r.data.tracks; recentNeedsReconnect = false; return }
-        if ((r.error || "").indexOf("Reconnect") === 0) recentNeedsReconnect = true
-        else report(r)
-      })
+      fetched["spotify:recent"] = false
+      fetchFresh("spotify:recent", "spotify.tracks", { id: "recent" }, tracksOf,
+                 function() { return recentTracks },
+                 function(v) { recentTracks = v; recentNeedsReconnect = false },
+                 function(r) {
+                   if ((r.error || "").indexOf("Reconnect") === 0) recentNeedsReconnect = true
+                   else report(r)
+                 })
     }
-    if (tab === "suno" && sunoReadyToBrowse && !suLists.length) {
-      loading = true
-      svc.call("suno.playlists", {}, function(r) { loading = false; if (r.ok) suLists = r.data; else report(r) })
-    }
+    if (tab === "suno" && sunoReadyToBrowse)
+      fetchFresh("suno:lists", "suno.playlists", {}, asIs,
+                 function() { return suLists }, function(v) { suLists = v }, sunoFetchFailed)
   }
 
   function openList(item) {
@@ -221,21 +337,16 @@ Panel {
       spOpen = item
       spTracks = []
       spRestricted = false
-      loading = true
-      svc.call("spotify.tracks", { id: item.id }, function(r) {
-        loading = false
-        if (!r.ok) { report(r); return }
-        spTracks = r.data.tracks
-        spRestricted = r.data.restricted
-      })
+      fetchFresh("spotify:list:" + item.id, "spotify.tracks", { id: item.id },
+                 function(d) { return { tracks: d.tracks, restricted: !!d.restricted } },
+                 function() { return spOpen && spOpen.id === item.id ? { tracks: spTracks, restricted: spRestricted } : null },
+                 function(v) { spTracks = v.tracks; spRestricted = v.restricted })
     } else {
       suOpen = item
       suTracks = []
-      loading = true
-      svc.call("suno.tracks", { id: item.id }, function(r) {
-        loading = false
-        if (r.ok) suTracks = r.data.tracks; else report(r)
-      })
+      fetchFresh("suno:list:" + item.id, "suno.tracks", { id: item.id }, tracksOf,
+                 function() { return suOpen && suOpen.id === item.id ? suTracks : null },
+                 function(v) { suTracks = v }, sunoFetchFailed)
     }
     list.positionViewAtBeginning()
   }
@@ -371,12 +482,21 @@ Panel {
   }
 
   // Sign-in finishing (or the engine coming up) makes the lists loadable.
-  onSpotifyReadyToBrowseChanged: if (spotifyReadyToBrowse) { recentNeedsReconnect = false; loadLists() } else { spLists = []; spOpen = null; recentTracks = []; subTracks = ({}) }
+  onSpotifyReadyToBrowseChanged: if (spotifyReadyToBrowse) { recentNeedsReconnect = false; loadLists() } else { spLists = []; spOpen = null; recentTracks = []; subTracks = ({}); forget("spotify:") }
+  // Remember sign-ins for the next time the engine is down. A sign-in that
+  // drops while the engine runs is a real sign-out; the engine stopping
+  // (st going away) is not.
+  onSpotifyLoggedInNowChanged: if (st) remember("login:spotify", spotifyLoggedInNow)
+  onSunoLoggedInNowChanged: {
+    if (sunoLoggedInNow) { sunoTrusted = true; remember("login:suno", true) }
+    else if (st) { sunoTrusted = false; remember("login:suno", false) }
+  }
   // Reconnecting while already signed in doesn't flip spotifyReadyToBrowse,
   // so refresh Recent when the browser round trip ends.
   onSpotifyLoggingInChanged: if (!spotifyLoggingIn && tab === "spotify" && spSub === "recent") { recentNeedsReconnect = false; loadLists() }
-  onSunoReadyToBrowseChanged: if (sunoReadyToBrowse) loadLists(); else { suLists = []; suOpen = null; subTracks = ({}) }
+  onSunoReadyToBrowseChanged: if (sunoReadyToBrowse) loadLists(); else { suLists = []; suOpen = null; subTracks = ({}); forget("suno:") }
   onOpenedChanged: if (opened) {
+    fetched = ({})
     svc.ensure()
     message = ""
     cursorActive = false
@@ -684,7 +804,7 @@ Panel {
 
         // Engine not up yet.
         Text {
-          visible: !root.st
+          visible: !root.st && (svc.startError !== "" || !root.rows.length)
           width: parent.width
           wrapMode: Text.Wrap
           textFormat: Text.PlainText
@@ -765,6 +885,9 @@ Panel {
           // The playlist or album that's playing right now.
           readonly property bool live: tile && !!root.now && !!row.item.uri && root.now.context === row.item.uri
           readonly property bool hasArt: (row.kind === "track" || tile) && !!row.item.image && String(row.item.image).indexOf("https://") === 0
+          // New since the cached list: fade in rather than pop.
+          Component.onCompleted: if (row.item && root.newKeys[root.rowKey(row.item)]) fadeIn.start()
+          NumberAnimation on opacity { id: fadeIn; running: false; from: 0; to: 1; duration: 350; easing.type: Easing.OutCubic }
           width: ListView.view.width - Style.space(8)
           height: row.kind === "header" ? Style.space(44)
                 : row.kind === "note" ? noteText.implicitHeight + Style.space(10)
