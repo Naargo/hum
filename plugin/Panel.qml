@@ -93,7 +93,11 @@ Panel {
         for (var k = 0; k < spTracks.length; k++) out.push({ kind: "track", source: "spotify", index: k, item: spTracks[k] })
         return out
       }
-      for (var m = 0; m < spLists.length; m++) out.push({ kind: "list", item: spLists[m] })
+      for (var m = 0; m < spLists.length; m++) {
+        var section = spLists[m].section
+        if (section && section !== (m > 0 ? spLists[m - 1].section : undefined)) out.push({ kind: "header", label: section })
+        out.push({ kind: "list", item: spLists[m] })
+      }
       return out
     }
     if (!suno.loggedIn) {
@@ -179,7 +183,7 @@ Panel {
     } else if (spOpen && spOpen.uri) {
       svc.call("spotify.play", { context: spOpen.uri, uri: row.item.uri }, report)
     } else {
-      // Liked Songs has no Spotify context to play from.
+      // Liked Songs and Recently Played have no Spotify context to play from.
       svc.call("spotify.play", { uris: spTracks.map(function(t) { return t.uri }), index: row.index }, report)
     }
   }
