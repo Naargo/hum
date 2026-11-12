@@ -90,7 +90,10 @@ void Spotify::login() {
         bool ours = url.path() == "/callback" && q.queryItemValue("state") == m_state && !m_state.isEmpty();
         QString code = q.queryItemValue("code");
         QString error = q.queryItemValue("error");
-        QByteArray body = ours && !code.isEmpty()
+        // Browsers sometimes load the callback twice. The second load comes
+        // after sign-in already finished, so tell it the good news too.
+        bool repeat = !ours && m_state.isEmpty() && url.path() == "/callback";
+        QByteArray body = (ours && !code.isEmpty()) || repeat
           ? "<!doctype html><title>Hum</title><body style='background:#111;color:#ddd;font:16px sans-serif;padding:3em'>Spotify is connected. You can close this tab."
           : "<!doctype html><title>Hum</title><body style='background:#111;color:#ddd;font:16px sans-serif;padding:3em'>Spotify sign-in didn't finish. Try again from the music panel.";
         sock->write("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: "
@@ -98,10 +101,14 @@ void Spotify::login() {
         sock->disconnectFromHost();
         connect(sock, &QTcpSocket::disconnected, sock, &QObject::deleteLater);
         if (!ours) return;
-        m_server->close();
-        m_server->deleteLater();
-        m_server = nullptr;
+        // Keep answering for a minute (see above), then let the port go.
         m_state.clear();
+        QTcpServer *server = m_server;
+        QTimer::singleShot(60 * 1000, server, [this, server] {
+          server->close();
+          server->deleteLater();
+          if (m_server == server) m_server = nullptr;
+        });
         if (code.isEmpty()) emit loginFailed(error.isEmpty() ? "Sign-in was cancelled" : error);
         else finishLogin(code);
       });

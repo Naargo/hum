@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import Quickshell
+import Quickshell.Widgets
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
@@ -16,10 +17,15 @@ Panel {
   ipcTarget: "hum"
   manageIpc: false
 
-  readonly property color fg: Commons.Color.popups.text
-  readonly property color dim: Qt.darker(fg, 1.6)
-  readonly property color accent: Commons.Color.accent
-  readonly property string font: Style.font.family
+  // Spotify's dark look: near-black panel, white text, grey for the quiet
+  // bits, green for what's playing.
+  readonly property color fg: "#ffffff"
+  readonly property color dim: "#b3b3b3"
+  readonly property color accent: "#1ed760"
+  readonly property color base: "#121212"
+  readonly property color hover: "#2a2a2a"
+  readonly property color chip: "#2a2a2a"
+  readonly property string font: "Noto Sans"
 
   function glyph(cp) { return String.fromCodePoint(cp) }
   readonly property string gMusic: glyph(0xF075A)
@@ -213,6 +219,34 @@ Panel {
     }
   }
 
+  function playOpen() {
+    message = ""
+    if (tab === "suno" && suOpen) svc.call("suno.play", { list: suOpen.id, index: 0 }, report)
+    else if (spOpen && spOpen.uri) svc.call("spotify.play", { context: spOpen.uri }, report)
+    else if (spTracks.length) svc.call("spotify.play", { uris: spTracks.map(function(t) { return t.uri }), index: 0 }, report)
+  }
+
+  // The green button on a tile: pause/resume it if it's what's playing,
+  // otherwise play it from the top without opening it.
+  function playTile(item, live) {
+    message = ""
+    if (live) { transport("toggle"); return }
+    if (tab === "suno") {
+      // The engine only plays a Suno list it has loaded, so load it first.
+      svc.call("suno.tracks", { id: item.id }, function(r) {
+        if (r.ok) svc.call("suno.play", { list: item.id, index: 0 }, report); else report(r)
+      })
+      return
+    }
+    if (item.uri) { svc.call("spotify.play", { context: item.uri }, report); return }
+    // Liked Songs has no context; fetch its songs and play them as a list.
+    svc.call("spotify.tracks", { id: item.id }, function(r) {
+      if (!r.ok) { report(r); return }
+      var uris = r.data.tracks.map(function(t) { return t.uri })
+      if (uris.length) svc.call("spotify.play", { uris: uris, index: 0 }, report)
+    })
+  }
+
   function activateRow(row) {
     if (!selectable(row)) return
     if (row.kind === "back") back()
@@ -312,6 +346,24 @@ Panel {
     }
   }
 
+  // F8 held: a quick tap plays or pauses on release; holding it for
+  // 400ms slides the panel out instead, and letting go then does nothing.
+  property bool mediaKeyHeld: false
+  Timer {
+    id: holdTimer
+    interval: 400
+    onTriggered: { root.mediaKeyHeld = true; root.togglePanel() }
+  }
+  function mediaKeyDown() {
+    mediaKeyHeld = false
+    holdTimer.restart()
+  }
+  function mediaKeyUp() {
+    if (!holdTimer.running) return  // the hold already opened the panel
+    holdTimer.stop()
+    Commons.IpcRegistry.call("media", "playPause", [])
+  }
+
   function togglePanel() {
     if (root.opened) root.close()
     else root.open()
@@ -323,6 +375,8 @@ Panel {
     function close(): void { root.close() }
     function toggle(): void { root.togglePanel() }
     function mediaKey(): void { root.mediaKey() }
+    function mediaKeyDown(): void { root.mediaKeyDown() }
+    function mediaKeyUp(): void { root.mediaKeyUp() }
   }
 
   // ---- bar icon ---------------------------------------------------------------
@@ -376,38 +430,108 @@ Panel {
         else if (t === "3") root.setTab("recent")
       }
 
-      // ---- header: the two sources ----
-      Row {
-        id: tabs
+      // Pure black behind everything, like Spotify's app frame.
+      Rectangle {
+        z: -2
+        anchors.fill: parent
+        anchors.margins: -panel.padding
+        color: "#000000"
+      }
+
+      // ---- search: a big pill on the black, Spotify tab only ----
+      TextField {
+        id: searchField
+        visible: root.tab === "spotify" && root.spotifyReadyToBrowse
         anchors.top: parent.top
         anchors.left: parent.left
-        spacing: Style.space(4)
+        anchors.right: parent.right
+        height: visible ? Style.space(44) : 0
+        foreground: root.fg
+        accent: root.accent
+        leftPadding: Style.space(42)
+        rightPadding: Style.space(16)
+        placeholderText: "What do you want to play?"
+        placeholderTextColor: root.dim
+        font.family: root.font
+        font.pixelSize: Style.font.body
+        background: Rectangle {
+          radius: height / 2
+          color: searchField.activeFocus || searchField.hovered ? "#2a2a2a" : "#1f1f1f"
+          border.width: searchField.activeFocus ? 2 : 0
+          border.color: root.fg
+          Text {
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(16)
+            anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
+            text: root.gSearch
+            color: searchField.activeFocus ? root.fg : root.dim
+            font.family: root.font
+            font.pixelSize: Style.font.title
+          }
+        }
+        onTextChanged: { root.query = text.trim(); searchDebounce.restart() }
+        Keys.onPressed: function(event) {
+          if (event.key === Qt.Key_Escape) {
+            if (text !== "") text = ""
+            else keyCatcher.forceActiveFocus()
+            event.accepted = true
+          } else if (event.key === Qt.Key_Down || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+            keyCatcher.forceActiveFocus()
+            root.cursorActive = false
+            root.moveCursor(1)
+            event.accepted = true
+          }
+        }
+      }
+
+      // ---- the browse card: rounded near-black on the black ----
+      Rectangle {
+        id: card
+        z: -1
+        anchors.top: searchField.visible ? searchField.bottom : parent.top
+        anchors.topMargin: searchField.visible ? Style.space(10) : 0
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: player.visible ? player.top : parent.bottom
+        anchors.bottomMargin: player.visible ? Style.space(4) : 0
+        radius: Style.space(8)
+        color: root.base
+      }
+
+      // ---- the sources, as pills ----
+      Row {
+        id: tabs
+        anchors.top: card.top
+        anchors.topMargin: Style.space(12)
+        anchors.left: card.left
+        anchors.leftMargin: Style.space(12)
+        spacing: Style.space(8)
         Repeater {
           model: [{ id: "spotify", label: "Spotify" }, { id: "suno", label: "Suno" }, { id: "recent", label: "Recent" }]
           Item {
             required property var modelData
-            width: tabLabel.implicitWidth + Style.space(20)
-            height: Style.space(28)
+            readonly property bool on: root.tab === modelData.id
+            width: tabLabel.implicitWidth + Style.space(26)
+            height: Style.space(32)
+            Rectangle {
+              anchors.fill: parent
+              radius: height / 2
+              color: parent.on ? root.fg : (pillMouse.containsMouse ? "#3a3a3a" : root.chip)
+            }
             Text {
               id: tabLabel
               anchors.centerIn: parent
               textFormat: Text.PlainText
               text: modelData.label
-              color: root.tab === modelData.id ? root.fg : root.dim
+              color: parent.on ? "#000000" : root.fg
               font.family: root.font
-              font.pixelSize: Style.font.title
-              font.bold: root.tab === modelData.id
-            }
-            Rectangle {
-              anchors.bottom: parent.bottom
-              anchors.horizontalCenter: parent.horizontalCenter
-              width: parent.width - Style.space(12)
-              height: Math.max(2, Style.space(2))
-              color: root.accent
-              visible: root.tab === modelData.id
+              font.pixelSize: Style.font.body
             }
             MouseArea {
+              id: pillMouse
               anchors.fill: parent
+              hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
               onClicked: root.setTab(modelData.id)
             }
@@ -417,7 +541,8 @@ Panel {
 
       Text {
         anchors.verticalCenter: tabs.verticalCenter
-        anchors.right: parent.right
+        anchors.right: card.right
+        anchors.rightMargin: Style.space(14)
         textFormat: Text.PlainText
         text: root.loading ? "Loading…" : ""
         color: root.dim
@@ -425,13 +550,15 @@ Panel {
         font.pixelSize: Style.font.caption
       }
 
-      // ---- everything between the header and the player ----
+      // ---- setup and messages, under the pills ----
       Column {
         id: topBlock
         anchors.top: tabs.bottom
         anchors.topMargin: Style.space(10)
-        anchors.left: parent.left
-        anchors.right: parent.right
+        anchors.left: card.left
+        anchors.right: card.right
+        anchors.leftMargin: Style.space(12)
+        anchors.rightMargin: Style.space(12)
         spacing: Style.space(8)
 
         // Engine not up yet.
@@ -446,7 +573,7 @@ Panel {
           font.pixelSize: Style.font.body
         }
 
-        // One-time Spotify setup: the Client ID of Tom's developer app.
+        // One-time Spotify setup: the Client ID of your developer app.
         Column {
           visible: root.tab === "spotify" && !!root.spotify && !root.spotify.configured
           width: parent.width
@@ -487,27 +614,6 @@ Panel {
           }
         }
 
-        // Search, Spotify only.
-        TextField {
-          id: searchField
-          visible: root.tab === "spotify" && root.spotifyReadyToBrowse
-          width: parent.width
-          placeholderText: root.gSearch + "  Search Spotify  ( / )"
-          onTextChanged: { root.query = text.trim(); searchDebounce.restart() }
-          Keys.onPressed: function(event) {
-            if (event.key === Qt.Key_Escape) {
-              if (text !== "") text = ""
-              else keyCatcher.forceActiveFocus()
-              event.accepted = true
-            } else if (event.key === Qt.Key_Down || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-              keyCatcher.forceActiveFocus()
-              root.cursorActive = false
-              root.moveCursor(1)
-              event.accepted = true
-            }
-          }
-        }
-
         Text {
           readonly property string sourceError: root.tab !== "suno" ? (root.spotify ? root.spotify.error : "") : (root.suno ? root.suno.error : "")
           visible: text !== ""
@@ -525,11 +631,13 @@ Panel {
       ListView {
         id: list
         anchors.top: topBlock.bottom
-        anchors.topMargin: Style.space(6)
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.bottom: player.top
-        anchors.bottomMargin: Style.space(8)
+        anchors.topMargin: Style.space(4)
+        anchors.left: card.left
+        anchors.right: card.right
+        anchors.leftMargin: Style.space(8)
+        anchors.rightMargin: Style.space(4)
+        anchors.bottom: card.bottom
+        anchors.bottomMargin: Style.space(6)
         clip: true
         model: root.rows
         boundsBehavior: Flickable.StopAtBounds
@@ -542,30 +650,41 @@ Panel {
           readonly property var row: modelData
           readonly property bool hot: root.cursorActive && root.cursor === index
           readonly property bool current: root.playingThis(row)
-          readonly property bool hasArt: (row.kind === "track" || row.kind === "list") && !!row.item.image && String(row.item.image).indexOf("https://") === 0
+          readonly property bool tile: row.kind === "list"
+          readonly property bool liked: tile && row.item.id === "liked"
+          // The playlist or album that's playing right now.
+          readonly property bool live: tile && !!root.now && !!row.item.uri && root.now.context === row.item.uri
+          readonly property bool hasArt: (row.kind === "track" || tile) && !!row.item.image && String(row.item.image).indexOf("https://") === 0
           width: ListView.view.width - Style.space(8)
-          height: row.kind === "header" ? Style.space(26)
+          height: row.kind === "header" ? Style.space(44)
                 : row.kind === "note" ? noteText.implicitHeight + Style.space(10)
-                : Style.space(row.kind === "track" ? 38 : 34)
+                : row.kind === "back" ? Style.space(60)
+                : tile ? Style.space(56)
+                : Style.space(row.kind === "track" ? 54 : 44)
 
+          // Tiles are grey cards; everything else lights up on hover.
           Rectangle {
             anchors.fill: parent
-            radius: Style.cornerRadius
+            anchors.topMargin: rowItem.tile ? Style.space(4) : 0
+            anchors.bottomMargin: rowItem.tile ? Style.space(4) : 0
+            radius: Style.space(4)
             visible: root.selectable(rowItem.row)
-            color: rowItem.hot ? Style.hoverFill : "transparent"
+            color: rowItem.tile ? (rowItem.hot ? Qt.rgba(1, 1, 1, 0.16) : Qt.rgba(1, 1, 1, 0.08))
+                 : rowItem.hot ? Qt.rgba(1, 1, 1, 0.10) : "transparent"
           }
 
+          // Section title, big and bold.
           Text {
             visible: rowItem.row.kind === "header"
             anchors.bottom: parent.bottom
-            anchors.bottomMargin: Style.space(4)
-            x: Style.space(8)
+            anchors.bottomMargin: Style.space(6)
+            x: Style.space(4)
             textFormat: Text.PlainText
             text: rowItem.row.kind === "header" ? rowItem.row.label : ""
-            color: root.dim
+            color: root.fg
             font.family: root.font
-            font.pixelSize: Style.font.caption
-            font.capitalization: Font.AllUppercase
+            font.pixelSize: Style.font.display
+            font.bold: true
           }
 
           Text {
@@ -582,24 +701,35 @@ Panel {
             font.pixelSize: Style.font.bodySmall
           }
 
+          // ---- a playlist or album tile: cover flush left, bold name ----
           Item {
-            visible: root.selectable(rowItem.row)
+            visible: rowItem.tile
             anchors.fill: parent
-            anchors.leftMargin: Style.space(8)
-            anchors.rightMargin: Style.space(8)
+            anchors.topMargin: Style.space(4)
+            anchors.bottomMargin: Style.space(4)
 
-            // Cover, or a glyph standing in for one.
-            Item {
-              id: lead
-              width: rowItem.row.kind === "back" ? Style.space(18) : Style.space(28)
-              height: width
-              anchors.verticalCenter: parent.verticalCenter
+            ClippingRectangle {
+              id: tileCover
+              anchors.left: parent.left
+              anchors.top: parent.top
+              anchors.bottom: parent.bottom
+              width: height
+              radius: Style.space(4)
+              color: "#282828"
+              Rectangle {
+                anchors.fill: parent
+                visible: rowItem.liked
+                gradient: Gradient {
+                  GradientStop { position: 0; color: "#e0284f" }
+                  GradientStop { position: 1; color: "#5c0a1c" }
+                }
+              }
               Image {
                 anchors.fill: parent
                 visible: rowItem.hasArt && status === Image.Ready
                 source: rowItem.hasArt ? rowItem.row.item.image : ""
-                sourceSize.width: Style.space(56)
-                sourceSize.height: Style.space(56)
+                sourceSize.width: Style.space(96)
+                sourceSize.height: Style.space(96)
                 fillMode: Image.PreserveAspectCrop
                 asynchronous: true
               }
@@ -607,30 +737,113 @@ Panel {
                 anchors.centerIn: parent
                 visible: !rowItem.hasArt
                 textFormat: Text.PlainText
+                text: rowItem.liked ? root.gHeart : root.gList
+                color: rowItem.liked ? "#1a0007" : root.dim
+                font.family: root.font
+                font.pixelSize: Style.font.display
+              }
+            }
+
+            Text {
+              anchors.left: tileCover.right
+              anchors.leftMargin: Style.space(12)
+              anchors.right: tilePlay.visible ? tilePlay.left : parent.right
+              anchors.rightMargin: Style.space(10)
+              anchors.verticalCenter: parent.verticalCenter
+              elide: Text.ElideRight
+              textFormat: Text.PlainText
+              text: rowItem.tile ? rowItem.row.item.name : ""
+              color: root.fg
+              font.family: root.font
+              font.pixelSize: Style.font.body
+              font.bold: true
+            }
+
+            // Green play button: shows on hover, stays on what's playing.
+            Rectangle {
+              id: tilePlay
+              z: 2
+              visible: rowItem.hot || rowItem.live
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(34)
+              height: width
+              radius: width / 2
+              color: tilePlayMouse.containsMouse ? "#3be477" : root.accent
+              Text {
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: rowItem.live && root.now.playing ? root.gPause : root.gPlay
+                color: "#000000"
+                font.family: root.font
+                font.pixelSize: Style.font.title
+              }
+              MouseArea {
+                id: tilePlayMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.playTile(rowItem.row.item, rowItem.live)
+              }
+            }
+          }
+
+          // ---- tracks, the back row and actions ----
+          Item {
+            visible: root.selectable(rowItem.row) && !rowItem.tile
+            anchors.fill: parent
+            anchors.leftMargin: Style.space(8)
+            anchors.rightMargin: Style.space(8)
+
+            Item {
+              id: lead
+              width: rowItem.row.kind === "back" ? Style.space(20) : rowItem.row.kind === "action" ? Style.space(28) : Style.space(40)
+              height: width
+              anchors.verticalCenter: parent.verticalCenter
+              ClippingRectangle {
+                anchors.fill: parent
+                radius: Style.space(4)
+                color: "#282828"
+                visible: rowItem.row.kind === "track"
+                Image {
+                  anchors.fill: parent
+                  visible: rowItem.hasArt && status === Image.Ready
+                  source: rowItem.hasArt ? rowItem.row.item.image : ""
+                  sourceSize.width: Style.space(80)
+                  sourceSize.height: Style.space(80)
+                  fillMode: Image.PreserveAspectCrop
+                  asynchronous: true
+                }
+              }
+              Text {
+                anchors.centerIn: parent
+                visible: !rowItem.hasArt
+                textFormat: Text.PlainText
                 text: rowItem.row.kind === "back" ? root.gBack
                     : rowItem.row.kind === "action" ? rowItem.row.glyph
-                    : rowItem.row.kind === "list" && (rowItem.row.item.id === "liked") ? root.gHeart
-                    : rowItem.row.kind === "list" ? root.gList : root.gMusic
-                color: rowItem.current ? root.accent : root.dim
+                    : root.gMusic
+                color: rowItem.row.kind === "back" ? root.fg : rowItem.current ? root.accent : root.dim
                 font.family: root.font
-                font.pixelSize: Style.font.heading
+                font.pixelSize: rowItem.row.kind === "back" ? Style.font.title : Style.font.heading
               }
             }
 
             Column {
               anchors.left: lead.right
-              anchors.leftMargin: Style.space(10)
-              anchors.right: trailing.left
+              anchors.leftMargin: Style.space(12)
+              anchors.right: rowItem.row.kind === "back" ? playBig.left : trailing.left
               anchors.rightMargin: Style.space(8)
               anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(2)
               Text {
                 width: parent.width
                 elide: Text.ElideRight
                 textFormat: Text.PlainText
-                text: rowItem.row.kind === "track" || rowItem.row.kind === "list" ? rowItem.row.item[rowItem.row.kind === "track" ? "title" : "name"] : rowItem.row.label
+                text: rowItem.row.kind === "track" ? rowItem.row.item.title : (rowItem.row.label || "")
                 color: rowItem.current ? root.accent : root.fg
                 font.family: root.font
-                font.pixelSize: Style.font.body
+                font.pixelSize: rowItem.row.kind === "back" ? Style.font.display : Style.font.body
                 font.bold: rowItem.row.kind === "back"
               }
               Text {
@@ -638,12 +851,38 @@ Panel {
                 visible: text !== ""
                 elide: Text.ElideRight
                 textFormat: Text.PlainText
-                text: rowItem.row.kind === "track" ? (rowItem.row.item.artist || "")
-                    : rowItem.row.kind === "list" && rowItem.row.item.owner && !rowItem.row.item.own ? "by " + rowItem.row.item.owner
-                    : ""
+                text: rowItem.row.kind === "track" ? (rowItem.row.item.artist || "") : ""
                 color: root.dim
                 font.family: root.font
-                font.pixelSize: Style.font.caption
+                font.pixelSize: Style.font.bodySmall
+              }
+            }
+
+            // Big green play on an open playlist or album.
+            Rectangle {
+              id: playBig
+              z: 2
+              visible: rowItem.row.kind === "back"
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              width: visible ? Style.space(46) : 0
+              height: width
+              radius: width / 2
+              color: playBigMouse.containsMouse ? "#3be477" : root.accent
+              Text {
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: root.gPlay
+                color: "#000000"
+                font.family: root.font
+                font.pixelSize: Style.font.display
+              }
+              MouseArea {
+                id: playBigMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.playOpen()
               }
             }
 
@@ -655,7 +894,7 @@ Panel {
               text: rowItem.row.kind === "track" && rowItem.row.item.duration > 0 ? root.mmss(rowItem.row.item.duration) : ""
               color: root.dim
               font.family: root.font
-              font.pixelSize: Style.font.caption
+              font.pixelSize: Style.font.bodySmall
             }
           }
 
@@ -670,53 +909,53 @@ Panel {
         }
       }
 
-      // ---- now playing ----
+      // ---- now playing, on the black ----
       Item {
         id: player
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom
-        height: root.now ? Style.space(84) : 0
+        height: root.now ? Style.space(132) : 0
         visible: root.now !== null
         clip: true
 
-        PanelSeparator {
-          anchors.top: parent.top
-          anchors.left: parent.left
-          anchors.right: parent.right
-          foreground: root.fg
-        }
-
-        Image {
+        // Song on the left: rounded cover, title, artist.
+        ClippingRectangle {
           id: art
           readonly property bool ok: !!root.now && !!root.now.image && String(root.now.image).indexOf("https://") === 0
-          x: 0
-          y: Style.space(14)
-          width: Style.space(48)
+          x: Style.space(4)
+          y: Style.space(10)
+          width: Style.space(56)
           height: width
-          source: ok ? root.now.image : ""
-          sourceSize.width: Style.space(96)
-          sourceSize.height: Style.space(96)
-          fillMode: Image.PreserveAspectCrop
-          asynchronous: true
-          visible: ok && status === Image.Ready
-        }
-        Text {
-          anchors.centerIn: art
-          visible: !art.visible
-          textFormat: Text.PlainText
-          text: root.gMusic
-          color: root.dim
-          font.family: root.font
-          font.pixelSize: Style.font.display
+          radius: Style.space(4)
+          color: "#282828"
+          Image {
+            anchors.fill: parent
+            source: art.ok ? root.now.image : ""
+            sourceSize.width: Style.space(112)
+            sourceSize.height: Style.space(112)
+            fillMode: Image.PreserveAspectCrop
+            asynchronous: true
+            visible: art.ok && status === Image.Ready
+          }
+          Text {
+            anchors.centerIn: parent
+            visible: !art.ok
+            textFormat: Text.PlainText
+            text: root.gMusic
+            color: root.dim
+            font.family: root.font
+            font.pixelSize: Style.font.display
+          }
         }
 
         Column {
           anchors.left: art.right
-          anchors.leftMargin: Style.space(10)
-          anchors.right: controls.left
-          anchors.rightMargin: Style.space(8)
-          y: Style.space(16)
+          anchors.leftMargin: Style.space(12)
+          anchors.right: parent.right
+          anchors.rightMargin: Style.space(4)
+          anchors.verticalCenter: art.verticalCenter
+          spacing: Style.space(2)
           Text {
             width: parent.width
             elide: Text.ElideRight
@@ -725,7 +964,6 @@ Panel {
             color: root.fg
             font.family: root.font
             font.pixelSize: Style.font.body
-            font.bold: true
           }
           Text {
             width: parent.width
@@ -734,15 +972,17 @@ Panel {
             text: root.now ? (root.now.artist || "") + (root.now.source === "suno" ? "  ·  Suno" : "") : ""
             color: root.dim
             font.family: root.font
-            font.pixelSize: Style.font.caption
+            font.pixelSize: Style.font.bodySmall
           }
         }
 
+        // Controls in the middle: grey skips around a white disc.
         Row {
           id: controls
-          anchors.right: parent.right
-          y: Style.space(18)
-          spacing: Style.space(4)
+          anchors.horizontalCenter: parent.horizontalCenter
+          anchors.top: art.bottom
+          anchors.topMargin: Style.space(6)
+          spacing: Style.space(18)
           Repeater {
             model: [
               { cmd: "previous", g: root.gPrev, on: !!root.now && root.now.canPrev },
@@ -751,20 +991,23 @@ Panel {
             ]
             Item {
               required property var modelData
-              width: Style.space(30)
-              height: Style.space(30)
+              readonly property bool big: modelData.cmd === "toggle"
+              width: Style.space(36)
+              height: Style.space(36)
               Rectangle {
-                anchors.fill: parent
+                anchors.centerIn: parent
+                width: parent.big ? (ctlMouse.containsMouse ? Style.space(36) : Style.space(34)) : 0
+                height: width
                 radius: width / 2
-                color: ctlMouse.containsMouse ? Style.hoverFill : "transparent"
+                color: root.fg
               }
               Text {
                 anchors.centerIn: parent
                 textFormat: Text.PlainText
                 text: modelData.g
-                color: modelData.on ? root.fg : root.dim
+                color: parent.big ? "#000000" : !modelData.on ? "#535353" : ctlMouse.containsMouse ? root.fg : root.dim
                 font.family: root.font
-                font.pixelSize: modelData.cmd === "toggle" ? Style.font.display : Style.font.heading
+                font.pixelSize: parent.big ? Style.font.title : Style.font.display
               }
               MouseArea {
                 id: ctlMouse
@@ -778,13 +1021,14 @@ Panel {
           }
         }
 
-        // Progress, click to seek.
+        // Progress under the controls, times either side. Click to seek.
         Item {
           id: progress
           anchors.left: parent.left
           anchors.right: parent.right
-          y: Style.space(70)
-          height: Style.space(12)
+          anchors.top: controls.bottom
+          anchors.topMargin: Style.space(4)
+          height: Style.space(16)
           Text {
             id: posText
             anchors.left: parent.left
@@ -812,16 +1056,29 @@ Panel {
             anchors.right: durText.left
             anchors.rightMargin: Style.space(8)
             anchors.verticalCenter: parent.verticalCenter
-            height: Math.max(2, Style.space(3))
+            height: Math.max(2, Style.space(4))
             radius: height / 2
-            color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.15)
+            color: "#4d4d4d"
             Rectangle {
+              id: fill
               width: root.now && root.now.duration > 0 ? parent.width * Math.min(1, root.position / root.now.duration) : 0
               height: parent.height
               radius: parent.radius
-              color: root.accent
+              color: seekMouse.containsMouse ? root.accent : root.fg
+            }
+            // The knob only shows while hovering, as in Spotify.
+            Rectangle {
+              visible: seekMouse.containsMouse
+              width: Style.space(12)
+              height: width
+              radius: width / 2
+              color: root.fg
+              anchors.verticalCenter: parent.verticalCenter
+              x: fill.width - width / 2
             }
             MouseArea {
+              id: seekMouse
+              hoverEnabled: true
               anchors.fill: parent
               anchors.margins: -Style.space(6)
               cursorShape: Qt.PointingHandCursor
