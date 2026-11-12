@@ -137,13 +137,14 @@ Panel {
     if (suSub !== "lists") return subRows("suno:" + suSub, "No songs here")
     if (suOpen) {
       out.push({ kind: "back", label: suOpen.name })
-      for (var n = 0; n < suTracks.length; n++) out.push({ kind: "track", source: "suno", index: n, item: suTracks[n] })
-      if (!suTracks.length && !loading) out.push({ kind: "note", label: "No songs here" })
+      for (var n = 0; n < suTracks.length; n++)
+        if (matches(suTracks[n].title, suTracks[n].artist)) out.push({ kind: "track", source: "suno", index: n, item: suTracks[n] })
+      if (out.length === 1 && !loading) out.push({ kind: "note", label: query !== "" ? "Nothing matches" : "No songs here" })
       return out
     }
     for (var p = 0; p < suLists.length; p++) {
       if (suLists[p].id === "liked" || suLists[p].id === "mine") continue  // sub-tabs
-      out.push({ kind: "list", item: suLists[p] })
+      if (matches(suLists[p].name)) out.push({ kind: "list", item: suLists[p] })
     }
     return out
   }
@@ -152,9 +153,17 @@ Panel {
   function subRows(key, empty) {
     var out = [], tracks = subTracks[key] || []
     for (var i = 0; i < tracks.length; i++)
-      out.push({ kind: "track", source: "sub", key: key, suno: key.indexOf("suno:") === 0, index: i, item: tracks[i] })
-    if (!tracks.length && !loading) out.push({ kind: "note", label: empty })
+      if (matches(tracks[i].title, tracks[i].artist))
+        out.push({ kind: "track", source: "sub", key: key, suno: key.indexOf("suno:") === 0, index: i, item: tracks[i] })
+    if (!out.length && !loading) out.push({ kind: "note", label: query !== "" ? "Nothing matches" : empty })
     return out
+  }
+
+  // The Suno tab's search: a plain match on names, as you type.
+  function matches(a, b) {
+    if (query === "") return true
+    var q = query.toLowerCase()
+    return String(a || "").toLowerCase().indexOf(q) >= 0 || String(b || "").toLowerCase().indexOf(q) >= 0
   }
 
   function selectable(row) { return row && row.kind !== "header" && row.kind !== "note" }
@@ -336,8 +345,10 @@ Panel {
   function setTab(name) {
     if (tab === name) return
     tab = name
+    if (query !== "") searchField.text = ""
     message = ""
     cursor = 0
+    list.positionViewAtBeginning()
     loadLists()
   }
 
@@ -348,6 +359,7 @@ Panel {
     interval: 350
     onTriggered: {
       var q = root.query
+      if (root.tab !== "spotify") return  // Suno filters as you type
       if (q === "") { root.spResults = null; return }
       root.loading = true
       svc.call("spotify.search", { q: q }, function(r) {
@@ -501,7 +513,9 @@ Panel {
       // ---- search: a big pill on the black, Spotify tab only ----
       TextField {
         id: searchField
-        visible: root.tab === "spotify" && root.spotifyReadyToBrowse
+        // On both tabs, so the list starts at the same height everywhere.
+        // Spotify searches Spotify; Suno has no search, so it filters yours.
+        visible: root.tab === "suno" ? root.sunoReadyToBrowse : root.spotifyReadyToBrowse
         // Under the source pills and sub-tabs, so switching tabs never moves
         // them; only what's below the search changes.
         anchors.top: subRow.bottom
@@ -515,7 +529,7 @@ Panel {
         accent: root.accent
         leftPadding: Style.space(42)
         rightPadding: Style.space(16)
-        placeholderText: "What do you want to play?"
+        placeholderText: root.tab === "suno" ? "Search your Suno songs" : "What do you want to play?"
         placeholderTextColor: root.dim
         font.family: root.font
         font.pixelSize: Style.font.body
@@ -645,7 +659,6 @@ Panel {
               color: parent.on ? root.fg : root.dim
               font.family: root.font
               font.pixelSize: Style.font.bodySmall
-              font.bold: parent.on
             }
             MouseArea {
               id: subMouse
@@ -722,17 +735,6 @@ Panel {
           }
         }
 
-        Text {
-          readonly property string sourceError: root.tab !== "suno" ? (root.spotify ? root.spotify.error : "") : (root.suno ? root.suno.error : "")
-          visible: text !== ""
-          width: parent.width
-          wrapMode: Text.Wrap
-          textFormat: Text.PlainText
-          text: root.message !== "" ? root.message : sourceError
-          color: Commons.Color.urgent
-          font.family: root.font
-          font.pixelSize: Style.font.bodySmall
-        }
       }
 
       // ---- the list ----
@@ -1014,6 +1016,40 @@ Panel {
             onEntered: { root.cursorActive = true; root.cursor = rowItem.index }
             onClicked: root.activateRow(rowItem.row)
           }
+        }
+      }
+
+      // Errors and notices float over the bottom of the list, so showing one
+      // never moves the rows.
+      Rectangle {
+        id: notice
+        readonly property string sourceError: root.tab !== "suno" ? (root.spotify ? root.spotify.error : "") : (root.suno ? root.suno.error : "")
+        readonly property string say: root.message !== "" ? root.message : sourceError
+        visible: say !== ""
+        z: 5
+        anchors.left: card.left
+        anchors.right: card.right
+        anchors.bottom: card.bottom
+        anchors.margins: Style.space(10)
+        height: noticeText.implicitHeight + Style.space(16)
+        radius: Style.space(6)
+        color: "#3a1d22"
+        Text {
+          id: noticeText
+          anchors.fill: parent
+          anchors.margins: Style.space(8)
+          verticalAlignment: Text.AlignVCenter
+          wrapMode: Text.Wrap
+          textFormat: Text.PlainText
+          text: notice.say
+          color: root.fg
+          font.family: root.font
+          font.pixelSize: Style.font.bodySmall
+        }
+        MouseArea {
+          anchors.fill: parent
+          cursorShape: Qt.PointingHandCursor
+          onClicked: root.message = ""  // click to dismiss
         }
       }
 
