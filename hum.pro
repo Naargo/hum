@@ -1,4 +1,5 @@
-QT += core gui widgets network dbus webenginecore webenginewidgets
+QT += core gui widgets network dbus sql webenginecore webenginewidgets
+LIBS += -lcrypto
 CONFIG += c++17
 TARGET = hum
 DESTDIR = build
@@ -13,7 +14,9 @@ SOURCES = \
   src/suno.cpp \
   src/player.cpp \
   src/mpris.cpp \
-  src/util.cpp
+  src/util.cpp \
+  src/brave.cpp \
+  src/sunopage.cpp
 
 HEADERS = \
   src/engine.h \
@@ -21,6 +24,8 @@ HEADERS = \
   src/suno.h \
   src/player.h \
   src/mpris.h \
-  src/util.h
+  src/util.h \
+  src/brave.h \
+  src/sunopage.h
 
 RESOURCES = src/resources.qrc

@@ -1,6 +1,7 @@
 #include "player.h"
 
 #include <QFile>
+#include <QTimer>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QWebEngineSettings>
@@ -18,10 +19,29 @@ Player::Player(QWebEngineProfile *profile, QObject *parent) : QWebEnginePage(pro
   // Tests run silent.
   if (qEnvironmentVariableIsSet("HUM_MUTE")) setAudioMuted(true);
 
+  reload();
+}
+
+void Player::reload() {
+  m_unloaded = false;
+  setLifecycleState(LifecycleState::Active);
   QFile f(":/player.html");
   f.open(QIODevice::ReadOnly);
   // Widevine and the SDK both want a secure origin; nothing is fetched from it.
   setHtml(QString::fromUtf8(f.readAll()), QUrl("https://hum.localhost/"));
+}
+
+void Player::unload() {
+  m_unloaded = true;
+  setHtml("<!doctype html>", QUrl("https://hum.localhost/"));
+  // Discarded lets Chromium drop the page's process entirely until
+  // reload() brings it back.
+  QTimer::singleShot(500, this, [this] {
+    if (!m_unloaded) return;
+    setLifecycleState(LifecycleState::Discarded);
+    if (qEnvironmentVariableIsSet("HUM_DEBUG"))
+      qInfo("player: discard -> state %d (recommended %d)", int(lifecycleState()), int(recommendedState()));
+  });
 }
 
 void Player::call(const QString &function, const QJsonArray &args) {

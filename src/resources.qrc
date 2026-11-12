@@ -1,5 +1,6 @@
 <RCC>
   <qresource prefix="/">
     <file alias="player.html">player.html</file>
+    <file alias="suno.js">suno.js</file>
   </qresource>
 </RCC>

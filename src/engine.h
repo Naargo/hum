@@ -7,6 +7,7 @@
 #include <QList>
 #include <QNetworkAccessManager>
 #include <QObject>
+#include <QPointer>
 #include <functional>
 
 class QLocalServer;
@@ -14,6 +15,7 @@ class QLocalSocket;
 class QWebEngineProfile;
 class Mpris;
 class Player;
+class SunoPage;
 class Spotify;
 class Suno;
 
@@ -44,6 +46,11 @@ private:
 
   void pageMessage(const QJsonObject &msg);
   void ensureSpotifyPlayer();
+  void createPlayer();
+  void callSpotify(const QString &function, const QJsonArray &args = QJsonArray());
+  void ensureSunoPage();
+  void dropSunoPage();
+  void unloadSpotifyPlayer();
   void whenSpotifyReady(const std::function<void(const QString &error)> &cb);
 
   // Spotify
@@ -78,7 +85,7 @@ private:
   QWebEngineProfile *m_profile;
   Spotify *m_spotify;
   Suno *m_suno;
-  Player *m_player;
+  QPointer<Player> m_player;  // null while Suno plays
   Mpris *m_mpris;
   QLocalServer *m_server;
   QList<QLocalSocket *> m_clients;
@@ -106,4 +113,6 @@ private:
   int m_sunoIndex = -1;
 
   QElapsedTimer m_idle;
+  bool m_reloadPending = false;  // Spotify page waiting for Suno's process to end
+  QPointer<SunoPage> m_sunoPage;  // exists only while Suno plays
 };

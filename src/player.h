@@ -18,6 +18,11 @@ public:
   Player(QWebEngineProfile *profile, QObject *parent = nullptr);
 
   void call(const QString &function, const QJsonArray &args = QJsonArray());
+  // Spotify's SDK costs memory even when quiet, so it's unloaded while Suno
+  // plays and loaded again when Spotify is wanted.
+  void unload();
+  void reload();
+  bool unloaded() const { return m_unloaded; }
 
 signals:
   void message(const QJsonObject &msg);
@@ -25,4 +30,7 @@ signals:
 protected:
   void javaScriptConsoleMessage(JavaScriptConsoleMessageLevel level, const QString &text,
                                 int line, const QString &source) override;
+
+private:
+  bool m_unloaded = false;
 };

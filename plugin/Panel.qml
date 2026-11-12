@@ -58,6 +58,15 @@ Panel {
   property var suOpen: null
   property var suTracks: []
   property var recentTracks: []
+  // Sub-tabs under each source. Liked (and Suno's My songs, and Spotify's
+  // Recent) are views of their own, not tiles among the playlists.
+  property string spSub: "lists"
+  property string suSub: "lists"
+  readonly property string sub: tab === "suno" ? suSub : spSub
+  readonly property var subTabs: tab === "suno"
+    ? [{ id: "lists", label: "Playlists" }, { id: "liked", label: "Liked", heart: true }, { id: "mine", label: "My songs" }]
+    : [{ id: "lists", label: "Playlists" }, { id: "liked", label: "Liked Songs", heart: true }, { id: "recent", label: "Recent" }]
+  property var subTracks: ({})  // "spotify:liked", "suno:mine", ... -> tracks
   property bool recentNeedsReconnect: false
   property bool loading: false
   property string message: ""
@@ -93,6 +102,16 @@ Panel {
         if (!spResults.tracks.length && !spResults.playlists.length) out.push({ kind: "note", label: "Nothing found" })
         return out
       }
+      if (spSub === "recent") {
+        if (recentNeedsReconnect) {
+          out.push({ kind: "action", id: "spotify.login", label: spotify.loggingIn ? "Waiting for your browser… (click to open it again)" : "Reconnect Spotify to see what you played recently", glyph: gMusic })
+          return out
+        }
+        for (var r = 0; r < recentTracks.length; r++) out.push({ kind: "track", source: "recent", index: r, item: recentTracks[r] })
+        if (!recentTracks.length && !loading) out.push({ kind: "note", label: "Nothing played yet" })
+        return out
+      }
+      if (spSub === "liked") return subRows("spotify:liked", "No liked songs yet")
       if (spOpen) {
         out.push({ kind: "back", label: spOpen.name })
         if (spRestricted) {
@@ -103,33 +122,38 @@ Panel {
         return out
       }
       for (var m = 0; m < spLists.length; m++) {
+        if (spLists[m].id === "liked") continue  // it has its own sub-tab
         var section = spLists[m].section
         if (section && section !== (m > 0 ? spLists[m - 1].section : undefined)) out.push({ kind: "header", label: section })
         out.push({ kind: "list", item: spLists[m] })
       }
       return out
     }
-    if (tab === "recent") {
-      if (!spotify.configured) return out
-      if (!spotify.loggedIn || recentNeedsReconnect) {
-        out.push({ kind: "action", id: "spotify.login", label: spotify.loggingIn ? "Waiting for your browser… (click to open it again)" : (recentNeedsReconnect ? "Reconnect Spotify to see what you played recently" : "Connect Spotify"), glyph: gMusic })
-        return out
-      }
-      for (var r = 0; r < recentTracks.length; r++) out.push({ kind: "track", source: "recent", index: r, item: recentTracks[r] })
-      if (!recentTracks.length && !loading) out.push({ kind: "note", label: "Nothing played yet" })
-      return out
-    }
     if (!suno.loggedIn) {
-      out.push({ kind: "action", id: "suno.login", label: suno.loggingIn ? "Finish signing in, in the Suno window" : "Sign in to Suno", glyph: gMusic })
+      out.push({ kind: "action", id: "suno.importBrave", label: "Use my Suno sign-in from Brave", glyph: gMusic })
+      out.push({ kind: "action", id: "suno.login", label: suno.loggingIn ? "Finish signing in, in the Suno window" : "Sign in to Suno here", glyph: gMusic })
       return out
     }
+    if (suSub !== "lists") return subRows("suno:" + suSub, "No songs here")
     if (suOpen) {
       out.push({ kind: "back", label: suOpen.name })
       for (var n = 0; n < suTracks.length; n++) out.push({ kind: "track", source: "suno", index: n, item: suTracks[n] })
       if (!suTracks.length && !loading) out.push({ kind: "note", label: "No songs here" })
       return out
     }
-    for (var p = 0; p < suLists.length; p++) out.push({ kind: "list", item: suLists[p] })
+    for (var p = 0; p < suLists.length; p++) {
+      if (suLists[p].id === "liked" || suLists[p].id === "mine") continue  // sub-tabs
+      out.push({ kind: "list", item: suLists[p] })
+    }
+    return out
+  }
+
+  // The songs of a sub-tab (Liked, My songs) as rows.
+  function subRows(key, empty) {
+    var out = [], tracks = subTracks[key] || []
+    for (var i = 0; i < tracks.length; i++)
+      out.push({ kind: "track", source: "sub", key: key, suno: key.indexOf("suno:") === 0, index: i, item: tracks[i] })
+    if (!tracks.length && !loading) out.push({ kind: "note", label: empty })
     return out
   }
 
@@ -137,7 +161,7 @@ Panel {
 
   function playingThis(row) {
     if (!now || row.kind !== "track") return false
-    return now.id === (row.source === "suno" ? row.item.id : row.item.uri)
+    return now.id === (row.source === "suno" || row.suno ? row.item.id : row.item.uri)
   }
 
   // ---- talking to the engine ----------------------------------------------
@@ -151,8 +175,20 @@ Panel {
       loading = true
       svc.call("spotify.playlists", {}, function(r) { loading = false; if (r.ok) spLists = r.data; else report(r) })
     }
-    // Recent reloads every time, so it's always current.
-    if (tab === "recent" && spotifyReadyToBrowse) {
+    // Liked and My songs load once; Recent reloads every time, so it's current.
+    var ready = tab === "suno" ? sunoReadyToBrowse : spotifyReadyToBrowse
+    var key = tab + ":" + sub
+    if (ready && (sub === "liked" || sub === "mine") && !subTracks[key]) {
+      loading = true
+      svc.call(tab === "suno" ? "suno.tracks" : "spotify.tracks", { id: sub }, function(r) {
+        loading = false
+        if (!r.ok) { report(r); return }
+        var next = Object.assign({}, subTracks)
+        next[key] = r.data.tracks
+        subTracks = next
+      })
+    }
+    if (tab === "spotify" && spSub === "recent" && spotifyReadyToBrowse) {
       loading = true
       svc.call("spotify.tracks", { id: "recent" }, function(r) {
         loading = false
@@ -207,6 +243,15 @@ Panel {
     message = ""
     if (row.source === "suno") {
       svc.call("suno.play", { list: suOpen.id, index: row.index }, report)
+    } else if (row.source === "sub" && row.suno) {
+      // The engine only plays a Suno list it has loaded (it forgets them
+      // when it restarts), so load it first.
+      var id = row.key.slice(5), index = row.index
+      svc.call("suno.tracks", { id: id }, function(r) {
+        if (r.ok) svc.call("suno.play", { list: id, index: index }, report); else report(r)
+      })
+    } else if (row.source === "sub") {
+      svc.call("spotify.play", { uris: subTracks[row.key].map(function(t) { return t.uri }), index: row.index }, report)
     } else if (row.source === "recent") {
       svc.call("spotify.play", { uris: recentTracks.map(function(t) { return t.uri }), index: row.index }, report)
     } else if (row.source === "search") {
@@ -272,6 +317,22 @@ Panel {
     return 0
   }
 
+  function setSub(name) {
+    if (query !== "") searchField.text = ""
+    if (tab === "suno") { if (suSub === name) return; suSub = name }
+    else { if (spSub === name) return; spSub = name }
+    message = ""
+    cursor = 0
+    list.positionViewAtBeginning()
+    loadLists()
+  }
+
+  function cycleSub(direction) {
+    var ids = subTabs.map(function(t) { return t.id })
+    var i = ids.indexOf(sub) + (direction < 0 ? -1 : 1)
+    setSub(ids[(i + ids.length) % ids.length])
+  }
+
   function setTab(name) {
     if (tab === name) return
     tab = name
@@ -298,11 +359,11 @@ Panel {
   }
 
   // Sign-in finishing (or the engine coming up) makes the lists loadable.
-  onSpotifyReadyToBrowseChanged: if (spotifyReadyToBrowse) { recentNeedsReconnect = false; loadLists() } else { spLists = []; spOpen = null; recentTracks = [] }
+  onSpotifyReadyToBrowseChanged: if (spotifyReadyToBrowse) { recentNeedsReconnect = false; loadLists() } else { spLists = []; spOpen = null; recentTracks = []; subTracks = ({}) }
   // Reconnecting while already signed in doesn't flip spotifyReadyToBrowse,
   // so refresh Recent when the browser round trip ends.
-  onSpotifyLoggingInChanged: if (!spotifyLoggingIn && tab === "recent") { recentNeedsReconnect = false; loadLists() }
-  onSunoReadyToBrowseChanged: if (sunoReadyToBrowse) loadLists(); else { suLists = []; suOpen = null }
+  onSpotifyLoggingInChanged: if (!spotifyLoggingIn && tab === "spotify" && spSub === "recent") { recentNeedsReconnect = false; loadLists() }
+  onSunoReadyToBrowseChanged: if (sunoReadyToBrowse) loadLists(); else { suLists = []; suOpen = null; subTracks = ({}) }
   onOpenedChanged: if (opened) {
     svc.ensure()
     message = ""
@@ -419,7 +480,7 @@ Panel {
       }
       onActivateRequested: if (root.cursorActive) root.activateRow(root.rows[root.cursor])
       onCloseRequested: root.close()
-      onTabRequested: function(direction) { root.setTab(root.tab === "spotify" ? "suno" : root.tab === "suno" ? "recent" : "spotify") }
+      onTabRequested: function(direction) { root.cycleSub(direction) }
       onTextKey: function(t) {
         if (t === " ") root.transport("toggle")
         else if (t === "n") root.transport("next")
@@ -427,7 +488,6 @@ Panel {
         else if (t === "/" && root.tab === "spotify" && root.spotifyReadyToBrowse) searchField.forceActiveFocus()
         else if (t === "1") root.setTab("spotify")
         else if (t === "2") root.setTab("suno")
-        else if (t === "3") root.setTab("recent")
       }
 
       // Pure black behind everything, like Spotify's app frame.
@@ -442,10 +502,15 @@ Panel {
       TextField {
         id: searchField
         visible: root.tab === "spotify" && root.spotifyReadyToBrowse
-        anchors.top: parent.top
-        anchors.left: parent.left
-        anchors.right: parent.right
-        height: visible ? Style.space(44) : 0
+        // Under the source pills and sub-tabs, so switching tabs never moves
+        // them; only what's below the search changes.
+        anchors.top: subRow.bottom
+        anchors.topMargin: visible ? Style.space(10) : 0
+        anchors.left: card.left
+        anchors.right: card.right
+        anchors.leftMargin: Style.space(12)
+        anchors.rightMargin: Style.space(12)
+        height: visible ? Style.space(40) : 0
         foreground: root.fg
         accent: root.accent
         leftPadding: Style.space(42)
@@ -489,8 +554,7 @@ Panel {
       Rectangle {
         id: card
         z: -1
-        anchors.top: searchField.visible ? searchField.bottom : parent.top
-        anchors.topMargin: searchField.visible ? Style.space(10) : 0
+        anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: player.visible ? player.top : parent.bottom
@@ -508,7 +572,7 @@ Panel {
         anchors.leftMargin: Style.space(12)
         spacing: Style.space(8)
         Repeater {
-          model: [{ id: "spotify", label: "Spotify" }, { id: "suno", label: "Suno" }, { id: "recent", label: "Recent" }]
+          model: [{ id: "spotify", label: "Spotify" }, { id: "suno", label: "Suno" }]
           Item {
             required property var modelData
             readonly property bool on: root.tab === modelData.id
@@ -550,10 +614,54 @@ Panel {
         font.pixelSize: Style.font.caption
       }
 
+      // ---- sub-tabs: smaller, quieter chips under the source pills ----
+      Row {
+        id: subRow
+        readonly property bool show: root.tab === "suno" ? root.sunoReadyToBrowse : root.spotifyReadyToBrowse
+        visible: show
+        height: show ? Style.space(28) : 0
+        anchors.top: tabs.bottom
+        anchors.topMargin: show ? Style.space(10) : 0
+        anchors.left: card.left
+        anchors.leftMargin: Style.space(12)
+        spacing: Style.space(6)
+        Repeater {
+          model: root.subTabs
+          Item {
+            required property var modelData
+            readonly property bool on: root.sub === modelData.id
+            width: subLabel.implicitWidth + Style.space(22)
+            height: Style.space(28)
+            Rectangle {
+              anchors.fill: parent
+              radius: height / 2
+              color: parent.on ? "#3a3a3a" : (subMouse.containsMouse ? root.chip : "transparent")
+            }
+            Text {
+              id: subLabel
+              anchors.centerIn: parent
+              textFormat: Text.PlainText
+              text: (modelData.heart ? root.gHeart + "  " : "") + modelData.label
+              color: parent.on ? root.fg : root.dim
+              font.family: root.font
+              font.pixelSize: Style.font.bodySmall
+              font.bold: parent.on
+            }
+            MouseArea {
+              id: subMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.setSub(modelData.id)
+            }
+          }
+        }
+      }
+
       // ---- setup and messages, under the pills ----
       Column {
         id: topBlock
-        anchors.top: tabs.bottom
+        anchors.top: searchField.visible ? searchField.bottom : subRow.bottom
         anchors.topMargin: Style.space(10)
         anchors.left: card.left
         anchors.right: card.right

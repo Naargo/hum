@@ -13,10 +13,21 @@ static void setChromiumFlags() {
   if (qEnvironmentVariableIsSet("QTWEBENGINE_CHROMIUM_FLAGS")) return;
   QStringList flags{
     "--disable-gpu",
-    "--renderer-process-limit=1",
-    "--disable-features=BackForwardCache,MediaRouter,OptimizationHints,Translate",
+    // No --renderer-process-limit=1: with Spotify's and Suno's pages taking
+    // turns, it made Spotify's page move into Suno's leftover process and
+    // keep all of Suno's memory.
+    // SpareRendererForSitePerProcess and site isolation each start extra
+    // page processes (a spare kept warm; suno.com's sign-in and payment
+    // frames in their own). For two known pages that's memory for nothing.
+    "--disable-features=BackForwardCache,MediaRouter,OptimizationHints,Translate,"
+      "SpareRendererForSitePerProcess,IsolateOrigins,site-per-process",
+    "--disable-site-isolation-trials",
     "--disable-background-networking",
-    "--js-flags=--max-old-space-size=96",
+    // Chromium's settings for low-memory phones: smaller caches and budgets
+    // everywhere. V8's lite mode skips the optimizing compiler, which costs
+    // speed these pages don't need (they only play music) and saves memory.
+    "--enable-low-end-device-mode",
+    "--js-flags=--max-old-space-size=64,--lite-mode,--optimize-for-size",
   };
   // Spotify's audio is Widevine-protected. Brave, Chrome and Chromium each
   // keep a copy of Google's Widevine module; Qt WebEngine can use it when

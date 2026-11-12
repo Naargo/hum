@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QHash>
+#include <QSet>
 #include <QJsonDocument>
 #include <QObject>
 #include <QPointer>
@@ -29,11 +30,22 @@ public:
 
   Suno(QNetworkAccessManager *net, QWebEngineProfile *profile, QObject *parent = nullptr);
 
-  bool loggedIn() const { return !m_client.isEmpty() && !m_signedOut; }
+  // Suno sets its __client cookie before anyone signs in, so having one
+  // proves nothing. Signed in means Suno handed us a session token for it.
+  bool loggedIn() const { return !m_client.isEmpty() && m_sessionOk && !m_signedOut; }
   bool loggingIn() const { return !m_window.isNull(); }
 
   void login();
   void logout();
+  // Reuse a Suno sign-in from Brave instead of signing in here. Returns
+  // an error, or "" when the cookies were handed over (the session check
+  // that follows decides whether that counts as signed in).
+  QString importFromBrave();
+  // Read the saved sign-in once the web profile is up. Replaying cookies
+  // straight from the constructor isn't reliable, so the engine calls this
+  // when its first page has loaded; if nothing usable turns up, the current
+  // sign-in is fetched from Brave.
+  void start();
   void withToken(const TokenReply &cb);
   void api(const QString &path, const Reply &cb);
 
@@ -46,6 +58,8 @@ private:
   void cookieRemoved(const QNetworkCookie &cookie);
   void checkLogin();
   void fetchToken(const TokenReply &cb);
+  void verify();
+  void tryCandidates(int from);
 
   QNetworkAccessManager *m_net;
   QWebEngineProfile *m_profile;
@@ -54,6 +68,20 @@ private:
   QString m_jwt;
   qint64 m_jwtExpires = 0;
   bool m_signedOut = false;
+  bool m_sessionOk = false;  // the cookie really opens a session
+  // Every __client cookie the profile holds, newest last. There can be more
+  // than one (a signed-out one from visiting suno.com, a signed-in one from
+  // Brave), so each is tried until one opens a session.
+  QList<QPair<QString, QString>> m_candidates;  // (value, auth host)
+  bool m_trying = false;
+  // Brave's __client values already copied in, so a stale one isn't copied
+  // over and over.
+  QSet<QString> m_fromBrave;
+  // The sign-in that last worked, kept in suno.json. The web profile keeps
+  // it too, but its cookie notifications can't be relied on to report it.
+  QString m_path;
+  void remember();
+  void addCandidate(const QString &value, const QString &host);
   QPointer<QWebEngineView> m_window;
   QList<TokenReply> m_waiting;
 };

@@ -3,6 +3,9 @@
 #include "player.h"
 #include "spotify.h"
 #include "suno.h"
+#include "sunopage.h"
+
+#include <malloc.h>
 #include "util.h"
 
 #include <QCoreApplication>
@@ -39,7 +42,7 @@ Engine::Engine(QObject *parent) : QObject(parent) {
 
   m_spotify = new Spotify(&m_net, this);
   m_suno = new Suno(&m_net, m_profile, this);
-  m_player = new Player(m_profile, this);
+  createPlayer();
   m_mpris = new Mpris(this);
   m_server = new QLocalServer(this);
 
@@ -50,15 +53,6 @@ Engine::Engine(QObject *parent) : QObject(parent) {
   connect(m_spotify, &Spotify::loginFailed, this, [this](const QString &e) { setError("spotify", e); });
   connect(m_suno, &Suno::authChanged, this, [this] { if (m_suno->loggedIn()) m_errors.remove("suno"); stateChanged(); });
   connect(m_suno, &Suno::loginFailed, this, [this](const QString &e) { setError("suno", e); });
-  connect(m_player, &Player::message, this, &Engine::pageMessage);
-  connect(m_player, &QWebEnginePage::renderProcessTerminated, this, [this] {
-    // The page is the speaker; if Chromium kills it, build a new one.
-    m_pageLoaded = false;
-    m_device.clear();
-    m_playing = false;
-    stateChanged();
-    QTimer::singleShot(1000, this, [this] { m_player->triggerAction(QWebEnginePage::Reload); });
-  });
 
   connect(m_mpris, &Mpris::playPause, this, &Engine::toggle);
   connect(m_mpris, &Mpris::play, this, &Engine::play);
@@ -148,6 +142,12 @@ void Engine::run(const QString &cmd, const QJsonObject &args, const Done &done) 
 
   if (cmd == "suno.login") { m_errors.remove("suno"); m_suno->login(); ok(); return; }
   if (cmd == "suno.logout") { m_suno->logout(); ok(); return; }
+  if (cmd == "suno.importBrave") {
+    m_errors.remove("suno");
+    QString error = m_suno->importFromBrave();
+    if (error.isEmpty()) ok(); else done({}, error);
+    return;
+  }
   if (cmd == "suno.playlists") { sunoPlaylists(done); return; }
   if (cmd == "suno.tracks") { sunoTracks(args.value("id").toString(), done); return; }
   if (cmd == "suno.play") {
@@ -231,11 +231,12 @@ void Engine::pageMessage(const QJsonObject &msg) {
   QString t = msg.value("t").toString();
   if (t == "loaded") {
     m_pageLoaded = true;
-    if (m_spotify->loggedIn()) m_player->call("startSpotify");
+    m_suno->start();
+    if (m_spotify->loggedIn()) callSpotify("startSpotify");
   } else if (t == "needToken") {
     m_spotify->withToken([this](const QString &token, const QString &error) {
       if (!error.isEmpty()) { setError("spotify", error); return; }
-      m_player->call("token", {token});
+      callSpotify("token", {token});
     });
   } else if (t == "ready") {
     m_device = msg.value("device").toString();
@@ -256,7 +257,7 @@ void Engine::pageMessage(const QJsonObject &msg) {
     QJsonObject tr = msg.value("track").toObject();
     if (m_source != "spotify" && !msg.value("paused").toBool()) {
       // Spotify started here from elsewhere; Suno steps aside.
-      m_player->call("sunoPause");
+      dropSunoPage();
     }
     if (m_source != "spotify" && msg.value("paused").toBool()) return;
     m_source = "spotify";
@@ -283,7 +284,12 @@ void Engine::pageMessage(const QJsonObject &msg) {
     stateChanged();
   } else if (t == "sunoEnded") {
     if (m_source == "suno" && m_sunoIndex + 1 < m_sunoQueue.size()) sunoPlayIndex(m_sunoIndex + 1);
-    else { m_playing = false; stateChanged(); }
+    else {
+      // Suno's page would carry on with its own next song; stop it.
+      if (m_sunoPage) m_sunoPage->call("pause");
+      m_playing = false;
+      stateChanged();
+    }
   } else if (t == "error") {
     QString source = msg.value("source").toString();
     QString message = msg.value("message").toString();
@@ -299,12 +305,13 @@ void Engine::pageMessage(const QJsonObject &msg) {
 }
 
 void Engine::ensureSpotifyPlayer() {
-  if (m_pageLoaded && m_spotify->loggedIn()) m_player->call("startSpotify");
+  if (m_pageLoaded && m_spotify->loggedIn()) callSpotify("startSpotify");
 }
 
 void Engine::whenSpotifyReady(const std::function<void(const QString &error)> &cb) {
   if (!m_device.isEmpty()) { cb(QString()); return; }
   if (!m_spotify->loggedIn()) { cb("Spotify isn't connected"); return; }
+  if (!m_player && !m_reloadPending) createPlayer();
   m_readyWaiters << cb;
   ensureSpotifyPlayer();
   // Give the SDK a fair chance, then say so instead of hanging.
@@ -533,10 +540,21 @@ void Engine::spotifyPlay(const QJsonObject &args, const Done &done) {
     return;
   }
 
-  m_player->call("sunoPause");
-  m_player->call("spActivate");
+  // Close Suno's page first. Chromium is told to keep one page process, so a
+  // Spotify page loaded while Suno's still exists moves into Suno's heavy
+  // process and keeps all its memory. A moment's wait lets that process end.
+  bool hadSuno = !m_sunoPage.isNull();
+  dropSunoPage();
+  if (!m_player) {
+    if (hadSuno) {
+      m_reloadPending = true;
+      QTimer::singleShot(1200, this, [this] { m_reloadPending = false; if (!m_player) createPlayer(); });
+    }
+    else createPlayer();
+  }
   whenSpotifyReady([=](const QString &error) {
     if (!error.isEmpty()) { done({}, error); return; }
+    callSpotify("spActivate");
     m_spotify->api("PUT", "/me/player/play?device_id=" + m_device, QJsonDocument(body), [=](const QJsonDocument &, const QString &err) {
       if (!err.isEmpty()) { setError("spotify", err); done({}, err); return; }
       m_errors.remove("spotify");
@@ -550,6 +568,10 @@ void Engine::spotifyPlay(const QJsonObject &args, const Done &done) {
 
 void Engine::sunoPlaylists(const Done &done) {
   m_suno->api("/api/playlist/me?page=1&show_trashed=false&show_sharelist=false", [=](const QJsonDocument &doc, const QString &error) {
+    // Signed out (or the session lapsed): say so rather than showing lists
+    // that can't load. Other errors still show Liked and My songs, which
+    // come from a different endpoint.
+    if (!m_suno->loggedIn()) { done({}, error.isEmpty() ? "Suno isn't connected" : error); return; }
     QJsonArray out;
     out.append(QJsonObject{{"id", "liked"}, {"name", "Liked"}});
     out.append(QJsonObject{{"id", "mine"}, {"name", "My songs"}});
@@ -571,15 +593,13 @@ void Engine::sunoPlaylists(const Done &done) {
 }
 
 static QJsonObject mapClip(const QJsonObject &c) {
-  QString audio = c.value("audio_url").toString();
-  if (!audio.startsWith("https://")) return {};
+  if (c.value("id").toString().isEmpty()) return {};
   QString status = c.value("status").toString();
   if (!status.isEmpty() && status != "complete" && status != "streaming") return {};
   return {
     {"id", c.value("id").toString()},
     {"title", util::clip(c.value("title").toString().isEmpty() ? QString("Untitled") : c.value("title").toString())},
     {"artist", util::clip(c.value("display_name").toString())},
-    {"audio", audio},
     {"image", c.value("image_url").toString()},
     {"duration", qint64(c.value("metadata").toObject().value("duration").toDouble() * 1000)},
   };
@@ -621,7 +641,11 @@ void Engine::sunoPlayIndex(int index) {
   if (index < 0 || index >= m_sunoQueue.size()) return;
   QJsonObject t = m_sunoQueue[index].toObject();
   m_sunoIndex = index;
-  if (m_source == "spotify" || !m_device.isEmpty()) m_player->call("spPause");
+  // Spotify's player steps out while Suno plays, to keep memory down.
+  if (m_player) {
+    if (!m_device.isEmpty()) m_player->call("spPause");
+    unloadSpotifyPlayer();
+  }
   m_source = "suno";
   m_now = QJsonObject{
     {"source", "suno"}, {"id", t.value("id").toString()},
@@ -636,8 +660,54 @@ void Engine::sunoPlayIndex(int index) {
   m_canPrev = true;
   m_context = "suno:" + m_sunoQueueId;
   m_errors.remove("suno");
-  m_player->call("sunoPlay", {t.value("audio").toString()});
+  ensureSunoPage();
+  m_sunoPage->playSong(t.value("id").toString());
   stateChanged();
+}
+
+// Spotify's page exists only while Spotify is wanted; Suno playing removes it.
+void Engine::createPlayer() {
+  m_player = new Player(m_profile, this);
+  connect(m_player, &Player::message, this, &Engine::pageMessage);
+  connect(m_player, &QWebEnginePage::renderProcessTerminated, this, [this] {
+    // The page is the speaker; if Chromium kills it, build a new one.
+    m_pageLoaded = false;
+    m_device.clear();
+    m_playing = false;
+    stateChanged();
+    QTimer::singleShot(1000, this, [this] { if (m_player) m_player->triggerAction(QWebEnginePage::Reload); });
+  });
+}
+
+void Engine::callSpotify(const QString &function, const QJsonArray &args) {
+  if (m_player) m_player->call(function, args);
+}
+
+void Engine::ensureSunoPage() {
+  if (m_sunoPage) return;
+  m_sunoPage = new SunoPage(m_profile, this);
+  connect(m_sunoPage, &SunoPage::message, this, &Engine::pageMessage);
+  connect(m_sunoPage, &QWebEnginePage::renderProcessTerminated, this, [this] {
+    setError("suno", "Suno's page stopped; play the song again");
+    if (m_source == "suno") { m_playing = false; stateChanged(); }
+  });
+}
+
+void Engine::dropSunoPage() {
+  if (!m_sunoPage) return;
+  m_sunoPage->deleteLater();
+  m_sunoPage = nullptr;
+  // suno.com leaves a lot of freed memory in this process that glibc keeps
+  // for reuse; once the page and its process are gone, hand it back.
+  QTimer::singleShot(15000, this, [] { malloc_trim(0); });
+}
+
+void Engine::unloadSpotifyPlayer() {
+  // Gone entirely, not just emptied: an empty page still holds a process.
+  if (m_player) m_player->deleteLater();
+  m_player = nullptr;
+  m_pageLoaded = false;
+  m_device.clear();
 }
 
 // ---------------------------------------------------------------- transport
@@ -645,18 +715,21 @@ void Engine::sunoPlayIndex(int index) {
 void Engine::toggle() { m_playing ? pause() : play(); }
 
 void Engine::play() {
-  if (m_source == "suno") m_player->call("sunoResume");
-  else if (m_source == "spotify") m_player->call("spResume");
+  if (m_source == "suno") {
+    // After an engine restart there's no page yet: start the song over.
+    if (m_sunoPage) m_sunoPage->call("resume"); else sunoPlayIndex(m_sunoIndex);
+  }
+  else if (m_source == "spotify") callSpotify("spResume");
 }
 
 void Engine::pause() {
-  if (m_source == "suno") m_player->call("sunoPause");
-  else if (m_source == "spotify") m_player->call("spPause");
+  if (m_source == "suno") { if (m_sunoPage) m_sunoPage->call("pause"); }
+  else if (m_source == "spotify") callSpotify("spPause");
 }
 
 void Engine::next() {
   if (m_source == "suno") sunoPlayIndex(m_sunoIndex + 1);
-  else if (m_source == "spotify") m_player->call("spNext");
+  else if (m_source == "spotify") callSpotify("spNext");
 }
 
 void Engine::previous() {
@@ -665,13 +738,13 @@ void Engine::previous() {
     if (pos > 3000 || m_sunoIndex == 0) seek(0);
     else sunoPlayIndex(m_sunoIndex - 1);
   } else if (m_source == "spotify") {
-    m_player->call("spPrev");
+    callSpotify("spPrev");
   }
 }
 
 void Engine::seek(qint64 ms) {
-  if (m_source == "suno") m_player->call("sunoSeek", {double(ms)});
-  else if (m_source == "spotify") m_player->call("spSeek", {double(ms)});
+  if (m_source == "suno") { if (m_sunoPage) m_sunoPage->call("seek", {double(ms)}); }
+  else if (m_source == "spotify") callSpotify("spSeek", {double(ms)});
   m_position = ms;
   m_positionAt = nowMs();
   stateChanged();
